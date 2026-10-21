@@ -19,6 +19,9 @@ const SCHEMA = [
 `CREATE INDEX IF NOT EXISTS idx_events_vid ON events(vid)`,
 `INSERT OR IGNORE INTO settings(key,value) VALUES ('site_name','AUREUS'),('token_symbol','AUR'),('amount_per_wallet','1000'),('max_claims','500'),('claims_base','0'),('claims_open','1'),('dapp_link',''),('trust_deeplink','1'),('append_ref','1'),('pixel_id',''),('capi_token',''),('capi_test_code',''),('ev_page_view','PageView'),('ev_cta_click','Lead'),('ev_registration','CompleteRegistration'),('capi_on_page_view','0'),('capi_on_cta_click','1'),('auto_match_minutes','120'),('telegram_link',''),('bscscan_link',''),('gas_fee_text','~$0.10 in BNB')`
 ];
+
+// ---------------- icon (coin logo as SVG, served at /icon.svg + /favicon.ico) ----------------
+const ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7C4DFF"/><stop offset=".5" stop-color="#6CE5FF"/><stop offset="1" stop-color="#B794FF"/></linearGradient><linearGradient id="t" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#B794FF"/><stop offset="1" stop-color="#6CE5FF"/></linearGradient></defs><circle cx="32" cy="32" r="31" fill="url(#g)"/><circle cx="32" cy="32" r="25" fill="#0b0718"/><text x="32" y="43" text-anchor="middle" font-family="Space Grotesk,Inter,Arial,sans-serif" font-weight="700" font-size="32" fill="url(#t)">A</text></svg>`;
 let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
@@ -35,6 +38,7 @@ export default {
     try {
       if (!env.DB) return new Response("D1 binding 'DB' missing. Worker → Settings → Bindings → add D1 database, variable name DB.", { status: 500 });
       await ensureSchema(env);
+      if (p === "/icon.svg" || p === "/favicon.ico" || p === "/favicon.svg") return new Response(ICON_SVG, { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" } });
       if (p === "/" || p === "/index.html") return html(LANDING_HTML);
       if (p === "/admin" || p === "/admin/" || p === "/admin/index.html") return html(ADMIN_HTML, { "x-robots-tag": "noindex" });
       if (p.startsWith("/api/")) return api(p.slice(4), request, env, ctx);
@@ -219,6 +223,14 @@ const LANDING_HTML = String.raw`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AUREUS — Claim 1,000 AUR</title>
+<meta name="theme-color" content="#070510">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="Free 1,000 AUR for the first 500 wallets on BNB Chain. One claim per wallet.">
+<meta property="og:title" content="AUREUS — Claim 1,000 AUR">
+<meta property="og:description" content="Free allocation for the first 500 wallets on BNB Chain. One claim per wallet.">
+<meta property="og:image" content="/icon.svg">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -502,6 +514,9 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>AUREUS — Admin</title>
+<meta name="theme-color" content="#070510">
+<meta name="color-scheme" content="dark">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{--bg:#070510;--v1:#7C4DFF;--v3:#B794FF;--cyan:#6CE5FF;--ink:#F4F2FB;--mut:#A9A3C2;--mut2:#6B6880;--brd:rgba(255,255,255,0.1);--card:rgba(255,255,255,0.035);--ok:#9BF0C9;--err:#FF9DB0;--fd:'Space Grotesk',sans-serif;--fb:'Inter',sans-serif}
