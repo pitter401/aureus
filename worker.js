@@ -7,7 +7,7 @@
 //         /api/*       API
 // Tables auto-create on first request. No contracts, no wallet connect here.
 
-const PUBLIC_KEYS = ["site_name","token_symbol","amount_per_wallet","max_claims","claims_open","dapp_link","trust_deeplink","append_ref","pixel_id","ev_page_view","ev_cta_click","telegram_link","bscscan_link"];
+const PUBLIC_KEYS = ["site_name","token_symbol","amount_per_wallet","max_claims","claims_open","dapp_link","trust_deeplink","append_ref","pixel_id","ev_page_view","ev_cta_click","telegram_link","bscscan_link","gas_fee_text"];
 const SECRET_KEYS = ["capi_token"];
 
 const SCHEMA = [
@@ -17,7 +17,7 @@ const SCHEMA = [
 `CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)`,
 `CREATE INDEX IF NOT EXISTS idx_events_addr ON events(address)`,
 `CREATE INDEX IF NOT EXISTS idx_events_vid ON events(vid)`,
-`INSERT OR IGNORE INTO settings(key,value) VALUES ('site_name','AUREUS'),('token_symbol','AUR'),('amount_per_wallet','1000'),('max_claims','500'),('claims_base','0'),('claims_open','1'),('dapp_link',''),('trust_deeplink','1'),('append_ref','1'),('pixel_id',''),('capi_token',''),('capi_test_code',''),('ev_page_view','PageView'),('ev_cta_click','Lead'),('ev_registration','CompleteRegistration'),('capi_on_page_view','0'),('capi_on_cta_click','1'),('auto_match_minutes','120'),('telegram_link',''),('bscscan_link','')`
+`INSERT OR IGNORE INTO settings(key,value) VALUES ('site_name','AUREUS'),('token_symbol','AUR'),('amount_per_wallet','1000'),('max_claims','500'),('claims_base','0'),('claims_open','1'),('dapp_link',''),('trust_deeplink','1'),('append_ref','1'),('pixel_id',''),('capi_token',''),('capi_test_code',''),('ev_page_view','PageView'),('ev_cta_click','Lead'),('ev_registration','CompleteRegistration'),('capi_on_page_view','0'),('capi_on_cta_click','1'),('auto_match_minutes','120'),('telegram_link',''),('bscscan_link',''),('gas_fee_text','~$0.10 in BNB')`
 ];
 let schemaReady = false;
 async function ensureSchema(env) {
@@ -331,11 +331,12 @@ const LANDING_HTML = String.raw`<!doctype html>
       <div class="hcoin"><span>A</span></div>
       <div class="pill"><span class="pdot"></span> <span id="pillTxt">500 SPOTS ONLY · LIVE NOW</span></div>
       <h1>Claim your<br><span id="h1Amt">1,000 AUR</span></h1>
-      <p class="sub">A free allocation for the first 500 wallets on BNB Chain. One claim per wallet — no purchase required.</p>
+      <p class="sub">A free allocation for the first 500 wallets on BNB Chain. One claim per wallet. Only a small network fee (<b id="gas1" style="color:#C9C2E8;font-weight:500">~$0.10 in BNB</b>) to process the claim.</p>
       <div class="card">
         <div class="alloc"><span class="k">Your allocation</span><span class="v" id="allocV">1,000 AUR</span></div>
         <a class="btn" id="mainBtn" href="#" rel="noopener">Claim now</a>
         <div class="hint" id="hint"><span class="tw"></span> Opens in Trust Wallet · takes 30 seconds</div>
+        <div class="hint" style="margin-top:6px">Keep <b id="gas2" style="color:#C9C2E8;font-weight:500;margin:0 4px">~$0.10 in BNB</b> in your wallet for the network fee</div>
         <div class="meter">
           <div class="mt"><span><b id="c1">0</b> claimed</span><span><b id="c2">500</b> remaining</span></div>
           <div class="track"><div class="fill" id="fill"></div></div>
@@ -348,7 +349,7 @@ const LANDING_HTML = String.raw`<!doctype html>
       <div class="sec-h">Claim in three steps</div>
       <div class="step"><div class="n">1</div><div><div class="t">Tap “Claim now”</div><div class="d">The claim app opens inside Trust Wallet (or your BEP20 wallet’s browser).</div></div></div>
       <div class="step"><div class="n">2</div><div><div class="t">Connect your wallet</div><div class="d">Approve the connection on BNB Chain. No token approvals, ever.</div></div></div>
-      <div class="step"><div class="n">3</div><div><div class="t">Receive your AUR</div><div class="d">Tokens land in your wallet. One claim per address, no repeats.</div></div></div>
+      <div class="step"><div class="n">3</div><div><div class="t">Confirm &amp; receive your AUR</div><div class="d">Approve the claim transaction (network fee <span id="gas3">~$0.10 in BNB</span>). Tokens land in your wallet. One claim per address.</div></div></div>
     </section>
 
     <section class="reveal">
@@ -391,9 +392,10 @@ const LANDING_HTML = String.raw`<!doctype html>
     <section class="reveal">
       <div class="eyebrow">QUESTIONS</div>
       <div class="sec-h">Good to know</div>
-      <details open><summary>Is it really free?<span class="chev">+</span></summary><p>Yes. The tokens cost nothing — you only pay the small BNB network gas fee to process the claim transaction.</p></details>
+      <details open><summary>Is it really free?<span class="chev">+</span></summary><p>Yes. The tokens cost nothing and nobody is paid for them. The only cost is the BNB Chain network fee (gas) for the claim transaction — about <span id="gas4">~$0.10 in BNB</span>, which goes to the network, not to us. Make sure your wallet holds a little BNB.</p></details>
       <details><summary>What happens after 500 claims?<span class="chev">+</span></summary><p>The pool closes. The page shows the airdrop as fully claimed and no further claims are possible.</p></details>
       <details><summary>Which wallets are supported?<span class="chev">+</span></summary><p>Trust Wallet is recommended. Any BEP20-compatible wallet with a DApp browser on BNB Chain also works.</p></details>
+      <details><summary>Why do I need BNB?<span class="chev">+</span></summary><p>Every transaction on BNB Chain needs a tiny gas fee paid in BNB. The claim is one transaction, so you need roughly <span id="gas5">~$0.10 in BNB</span> in the same wallet. If you have zero BNB, the wallet will not let you confirm.</p></details>
       <details><summary>Can I claim twice?<span class="chev">+</span></summary><p>No. Each address is recorded and allowed a single claim.</p></details>
     </section>
 
@@ -403,7 +405,7 @@ const LANDING_HTML = String.raw`<!doctype html>
 
     <footer>
       <div class="brand" style="justify-content:center;margin-bottom:12px"><div class="mark" style="width:26px;height:26px;font-size:12px">A</div><b style="font-size:14px">AUREUS</b></div>
-      <div class="fs"><span id="symF">AUR</span> · BNB Chain<span id="contractWrap"> · <a id="contractLink" href="#" style="color:var(--v3);text-decoration:none" target="_blank" rel="noopener">Contract on BscScan</a></span><span id="tgWrap"> · <a id="tgLink" href="#" style="color:var(--v3);text-decoration:none" target="_blank" rel="noopener">Telegram</a></span><br>Network gas fees apply.</div>
+      <div class="fs"><span id="symF">AUR</span> · BNB Chain<span id="contractWrap"> · <a id="contractLink" href="#" style="color:var(--v3);text-decoration:none" target="_blank" rel="noopener">Contract on BscScan</a></span><span id="tgWrap"> · <a id="tgLink" href="#" style="color:var(--v3);text-decoration:none" target="_blank" rel="noopener">Telegram</a></span><br>Network gas fee (<span id="gas6">~$0.10 in BNB</span>) applies.</div>
       <div class="fnote">This is an airdrop of a free token with no guaranteed value. Not financial advice. Do your own research.</div>
     </footer>
   </div>
@@ -454,6 +456,7 @@ const LANDING_HTML = String.raw`<!doctype html>
       $('allocV').textContent=fmt(amt)+' '+sym; $('h1Amt').textContent=fmt(amt)+' '+sym;
       $('symV').textContent=sym; $('symF').textContent=sym; $('poolV').textContent=fmt(Number(amt)*max);
       $('pillTxt').textContent=fmt(max)+' SPOTS ONLY · LIVE NOW';
+      var g=c.gas_fee_text||'~$0.10 in BNB';['gas1','gas2','gas3','gas4','gas5','gas6'].forEach(function(id){if($(id))$(id).textContent=g});
       counter(c.total_claims||0,max);
       if(c.bscscan_link)$('contractLink').href=c.bscscan_link;else $('contractWrap').style.display='none';
       if(c.telegram_link)$('tgLink').href=c.telegram_link;else $('tgWrap').style.display='none';
@@ -660,6 +663,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
       <div class="f"><label>Max claims (display)</label><input data-k="max_claims"></div>
       <div class="f"><label>Claimed counter base <span class="mut">(added to fired registrations)</span></label><input data-k="claims_base" placeholder="0"></div>
       <div class="f"><label>Auto-match window (minutes)</label><input data-k="auto_match_minutes" placeholder="120"></div>
+      <div class="f"><label>Network fee text <span class="mut">(shown on page)</span></label><input data-k="gas_fee_text" placeholder="~$0.10 in BNB"></div>
       <div class="f"><label>BscScan link (footer, optional)</label><input data-k="bscscan_link" placeholder="https://bscscan.com/token/0x…"></div>
       <div class="f"><label>Telegram link (footer, optional)</label><input data-k="telegram_link" placeholder="https://t.me/…"></div>
     </div>
