@@ -282,6 +282,38 @@ async function admin(path, request, env) {
     catch (e) { return json({ ok: false, error: e.message }, 400); }
   }
 
+  // ===== RETRY PENDING: saare unmatched cta_click ke liye Lead fire karo Meta ko =====
+  if (path === "/retry-pending" && request.method === "POST") {
+    if (!s.pixel_id || !s.capi_token) return json({ ok: false, error: "Set Pixel ID + CAPI token in Meta tab first" }, 400);
+    const leadEv = s.ev_cta_click || "Lead";
+    // Saare unmatched cta_click jo abhi tak kisi claim se match nahi hue
+    const { results: pending } = await env.DB.prepare(
+      "SELECT * FROM events WHERE type='cta_click' AND capi_status IN ('held','error','skipped') AND matched=0 ORDER BY id ASC LIMIT 100"
+    ).all();
+    if (!pending.length) return json({ ok: true, fired: 0, message: "No pending clicks found" });
+    const fired = [], skipped = [];
+    const seenVid = new Set();
+    for (const click of pending) {
+      // Ek visitor ke liye sirf ek Lead
+      const vidKey = click.vid || String(click.id);
+      if (seenVid.has(vidKey)) { skipped.push(click.id); continue; }
+      seenVid.add(vidKey);
+      const eid = "retry-" + click.id + "-" + Date.now();
+      let capi = "skipped";
+      try {
+        await sendCapi(s, { name: leadEv, eventId: eid, ip: click.ip, ua: click.ua, fbp: click.fbp, fbc: click.fbc, url: "https://" + host + "/", extId: click.vid || String(click.id), test: false });
+        capi = "sent";
+        await env.DB.prepare("UPDATE events SET capi_status='sent', event_id=?, note=COALESCE(note,'')|| ' retried' WHERE id=?").bind(eid, click.id).run();
+        fired.push(click.id);
+      } catch (e) {
+        capi = "error:" + String(e.message).slice(0, 100);
+        await env.DB.prepare("UPDATE events SET capi_status=? WHERE id=?").bind(capi, click.id).run();
+        skipped.push(click.id);
+      }
+    }
+    return json({ ok: true, fired: fired.length, skipped: skipped.length, total_pending: pending.length });
+  }
+
   // ===== MANUAL FIRE: admin got the claim message from the DApp → fire CompleteRegistration for that wallet =====
   if (path === "/fire" && request.method === "POST") {
     if (!s.pixel_id || !s.capi_token) return json({ ok: false, error: "Set Pixel ID + CAPI token in Meta tab first" }, 400);
@@ -825,6 +857,11 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <!-- ============ DASHBOARD ============ -->
 <div class="panel" id="p-dash">
   <div class="grid" id="stats"></div>
+  <div class="card" style="margin-bottom:12px">
+    <h3>Pending Leads <small>unmatched CTA clicks</small></h3>
+    <p style="color:var(--sub);font-size:13px;margin:0 0 10px">Purane unmatched clicks ke liye Meta ko Lead fire karo. Bot fix se pehle ke clicks jo miss ho gaye the.</p>
+    <div class="row"><button class="btn go" id="retryBtn" onclick="retryPending()">🔁 Retry All Pending Leads</button><span class="msg" id="retryMsg"></span></div>
+  </div>
   <div class="card">
     <h3>Funnel <small>all time</small></h3>
     <div class="funnel" id="funnel"></div>
@@ -1010,6 +1047,20 @@ function loadLeads(off){
 }
 function useLead(id){pick(id);document.querySelector('.tabs button[data-t=fire]').click()}
 $('lq').addEventListener('keydown',function(e){if(e.key==='Enter')loadLeads(0)});
+
+// ---- Retry Pending Leads ----
+function retryPending(){
+  var btn=$('retryBtn'),msg=$('retryMsg');
+  btn.disabled=true;msg.textContent='Firing…';msg.className='msg';
+  api('/retry-pending',{method:'POST'}).then(function(j){
+    btn.disabled=false;
+    if(!j.ok){msg.textContent='Error: '+(j.error||'unknown');msg.className='msg err';return}
+    if(j.fired===0){msg.textContent=j.message||'No pending clicks found ✓';msg.className='msg ok';return}
+    msg.textContent='✅ '+j.fired+' Leads fired'+(j.skipped?' ('+j.skipped+' skipped)':'');
+    msg.className='msg ok';
+    setTimeout(loadDash,1000);
+  }).catch(function(e){btn.disabled=false;msg.textContent='Error: '+e.message;msg.className='msg err'});
+}
 
 // ---- Dashboard ----
 function loadDash(){
