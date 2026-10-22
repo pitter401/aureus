@@ -232,7 +232,16 @@ async function admin(path, request, env) {
   if (path === "/settings" && request.method === "GET") { const o = { ...s }; for (const k of SECRET_KEYS) o[k] = o[k] ? "••••" + o[k].slice(-4) : ""; return json(o); }
   if (path === "/settings" && request.method === "PUT") {
     const b = await request.json();
-    for (const [k, v] of Object.entries(b)) { if (SECRET_KEYS.includes(k) && String(v).startsWith("••••")) continue; await setSetting(env, k, v); }
+    for (const [k, v] of Object.entries(b)) {
+      if (SECRET_KEYS.includes(k)) {
+        const sv = String(v);
+        // Skip if masked (contains bullet dots) or empty (don't overwrite with blank)
+        if (!sv || sv.includes("•") || /^\*+$/.test(sv)) continue;
+        // Also skip if it looks like a partial reveal (starts with dots of any kind)
+        if (/^[•\.\*]{2,}/.test(sv)) continue;
+      }
+      await setSetting(env, k, v);
+    }
     return json({ ok: true });
   }
   if (path === "/stats") {
