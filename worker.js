@@ -8,7 +8,7 @@
 // Tables auto-create on first request. No contracts, no wallet connect here.
 
 const PUBLIC_KEYS = ["site_name","token_symbol","amount_per_wallet","max_claims","claims_open","dapp_link","trust_deeplink","append_ref","pixel_id","ev_page_view","ev_cta_click","telegram_link","bscscan_link","gas_fee_text"];
-const SECRET_KEYS = ["capi_token"];
+const SECRET_KEYS = ["capi_token","hook_secret"];
 
 const SCHEMA = [
 `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
@@ -17,7 +17,7 @@ const SCHEMA = [
 `CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)`,
 `CREATE INDEX IF NOT EXISTS idx_events_addr ON events(address)`,
 `CREATE INDEX IF NOT EXISTS idx_events_vid ON events(vid)`,
-`INSERT OR IGNORE INTO settings(key,value) VALUES ('site_name','AUREUS'),('token_symbol','AUR'),('amount_per_wallet','1000'),('max_claims','500'),('claims_base','0'),('claims_open','1'),('dapp_link',''),('trust_deeplink','1'),('append_ref','1'),('pixel_id',''),('capi_token',''),('capi_test_code',''),('ev_page_view','PageView'),('ev_cta_click','Lead'),('ev_registration','CompleteRegistration'),('capi_on_page_view','0'),('capi_on_cta_click','1'),('auto_match_minutes','120'),('telegram_link',''),('bscscan_link',''),('gas_fee_text','~$0.10 in BNB')`
+`INSERT OR IGNORE INTO settings(key,value) VALUES ('site_name','AUREUS'),('token_symbol','AUR'),('amount_per_wallet','1000'),('max_claims','500'),('claims_base','0'),('claims_open','1'),('dapp_link',''),('trust_deeplink','1'),('append_ref','1'),('pixel_id',''),('capi_token',''),('capi_test_code',''),('ev_page_view','PageView'),('ev_cta_click','Lead'),('ev_registration','CompleteRegistration'),('capi_on_page_view','0'),('capi_on_cta_click','1'),('auto_match_minutes','120'),('telegram_link',''),('bscscan_link',''),('gas_fee_text','~$0.10 in BNB'),('allowed_countries','IN'),('block_hosting','1'),('hook_secret',''),('lead_on_claim','0'),('claim_window_minutes','30'),('hook_also_registration','0')`
 ];
 
 // ---------------- icon (coin logo as SVG, served at /icon.svg + /favicon.ico) ----------------
@@ -27,7 +27,7 @@ async function ensureSchema(env) {
   if (schemaReady) return;
   await env.DB.batch(SCHEMA.map(s => env.DB.prepare(s)));
   // if an older events table exists, add the new columns (ignore "duplicate column" errors)
-  for (const c of ["vid TEXT","matched INTEGER DEFAULT 0","click_id INTEGER","note TEXT"]) { try { await env.DB.prepare("ALTER TABLE events ADD COLUMN " + c).run(); } catch (e) {} }
+  for (const c of ["vid TEXT","matched INTEGER DEFAULT 0","click_id INTEGER","note TEXT","country TEXT","net TEXT","asn INTEGER"]) { try { await env.DB.prepare("ALTER TABLE events ADD COLUMN " + c).run(); } catch (e) {} }
   schemaReady = true;
 }
 
@@ -61,21 +61,44 @@ async function allSettings(env) { const { results } = await env.DB.prepare("SELE
 async function setSetting(env, key, value) { await env.DB.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, String(value)).run(); }
 async function registrations(env) { const c = await env.DB.prepare("SELECT COUNT(*) n FROM events WHERE type='registration' AND capi_status='sent'").first(); return c.n; }
 
+// ---------------- visitor gate: country + VPN/datacenter check (Cloudflare request.cf) ----------------
+const HOSTING_RE = /amazon|aws|google|microsoft|azure|digitalocean|linode|connected cloud|ovh|hetzner|vultr|choopa|leaseweb|m247|datacamp|contabo|oracle|alibaba|tencent|hostinger|scaleway|g-core|gcore|cdn77|datapacket|zenlayer|psychz|quadranet|colocrossing|hostwinds|ionos|kamatera|upcloud|servers\.com|hosting|data ?cent(er|re)|\bvpn\b|proxy|cogent|packethub|ipxo|clouvider|tzulo|hivelocity|serverion|interserver|worldstream|frantech|buyvm|racknerd|dedipath|terrahost|xtom|aeza|stark industries|global secure layer|private layer|incognet|ipvolume|sharktech|egihosting|netcup|bitlaunch|mevspace|nforce|cloudinnovation|fdcservers|tier\.net|limestone|velia|hostroyale|ovpn|nordvpn|expressvpn|surfshark|mullvad|proton/i;
+function geo(request) {
+  const cf = request.cf || {};
+  return { country: cf.country ? String(cf.country).toUpperCase() : null, asn: cf.asn || null, net: cf.asOrganization ? String(cf.asOrganization).slice(0, 80) : null, ua: request.headers.get("user-agent") || "" };
+}
+function gate(s, g) {
+  if (g.asn === 32934 || /facebookexternalhit|facebot|meta-externalagent/i.test(g.ua)) return { ok: true, meta: true };   // Meta ad review bot
+  const allow = String(s.allowed_countries || "").toUpperCase().split(/[\s,;]+/).filter(Boolean);
+  if (allow.length && g.country && !allow.includes(g.country)) return { ok: false, reason: "country" };
+  if (s.block_hosting === "1" && g.net && HOSTING_RE.test(g.net)) return { ok: false, reason: "vpn" };
+  return { ok: true };
+}
+function browserOf(ua) {
+  ua = ua || "";
+  const b = /FBAN|FBAV|FB_IAB|FBIOS/.test(ua) ? "Facebook app" : /Instagram/.test(ua) ? "Instagram" : /Trust/i.test(ua) ? "Trust Wallet" : /EdgA?\//.test(ua) ? "Edge" : /SamsungBrowser/.test(ua) ? "Samsung" : /OPR|Opera/.test(ua) ? "Opera" : /CriOS|Chrome\//.test(ua) ? "Chrome" : /Firefox|FxiOS/.test(ua) ? "Firefox" : /Safari/.test(ua) ? "Safari" : "Other";
+  const os = /Android/.test(ua) ? "Android" : /iPhone|iPad|iOS/.test(ua) ? "iOS" : /Windows/.test(ua) ? "Windows" : /Mac OS/.test(ua) ? "Mac" : /Linux/.test(ua) ? "Linux" : "";
+  return b + (os ? " · " + os : "");
+}
+
 // ---------------- API router ----------------
 async function api(path, request, env, ctx) {
   if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-  if (path === "/config" && request.method === "GET") return json(await getConfig(env));
+  if (path === "/config" && request.method === "GET") return json(await getConfig(env, request));
   if (path === "/event" && request.method === "POST") return event(request, env);
+  if ((path === "/hook/claim" || path === "/hook") && request.method === "POST") return hookClaim(request, env);
   if (path.startsWith("/admin")) return admin(path.slice(6) || "/", request, env);
   return json({ error: "not found" }, 404);
 }
 
-async function getConfig(env) {
+async function getConfig(env, request) {
   const s = await allSettings(env);
   const pub = {}; for (const k of PUBLIC_KEYS) pub[k] = s[k] ?? "";
   const total = Number(s.claims_base || 0) + await registrations(env);
   const max = Number(s.max_claims || 500);
-  return { ...pub, total_claims: total, remaining: Math.max(0, max - total) };
+  const g = gate(s, geo(request));
+  if (!g.ok) pub.dapp_link = "";            // blocked visitors never receive the DApp link
+  return { ...pub, total_claims: total, remaining: Math.max(0, max - total), allowed: g.ok, block_reason: g.reason || null };
 }
 
 // Public page events: page_view, cta_click
@@ -87,23 +110,79 @@ async function event(request, env) {
   const ip = request.headers.get("cf-connecting-ip") || "";
   const ua = (request.headers.get("user-agent") || "").slice(0, 300);
   const vid = String(b.vid || "").slice(0, 64) || null;
+  const g = geo(request), gt = gate(s, g);
   const evName = s["ev_" + type] || "";
   let fire = s["capi_on_" + type] === "1" && evName && s.pixel_id && s.capi_token;
-  let capi = "skipped";
+  let capi = "skipped", logType = type, note = null;
   const eventId = b.event_id || crypto.randomUUID();
-  // one Lead per visitor: a repeat click from the same visitor is logged but NOT re-sent to Meta
   let dup = false;
-  if (type === "cta_click" && vid) {
+  if (type === "cta_click" && (!gt.ok || gt.meta)) {
+    // outside allowed country / VPN / datacenter / Meta review bot → logged separately, never a Lead, never sent to Meta
+    logType = "blocked_click"; note = gt.meta ? "meta_review" : gt.reason; fire = false; capi = "blocked";
+  } else if (type === "cta_click" && s.lead_on_claim === "1") {
+    // Lead is held until the DApp/bot confirms a real claim (via /api/hook/claim); click is only logged
+    fire = false; capi = "held";
+    if (vid) { const prev = await env.DB.prepare("SELECT id FROM events WHERE type='cta_click' AND vid=? LIMIT 1").bind(vid).first(); if (prev) dup = true; }
+  } else if (type === "cta_click" && vid) {
+    // one Lead per visitor: a repeat click from the same visitor is logged but NOT re-sent to Meta
     const prev = await env.DB.prepare("SELECT id FROM events WHERE type='cta_click' AND vid=? LIMIT 1").bind(vid).first();
     if (prev) { dup = true; fire = false; capi = "dup"; }
+  } else if (type === "page_view") {
+    if (!gt.ok || gt.meta) { fire = false; capi = "blocked"; note = gt.meta ? "meta_review" : gt.reason; }
+    else if (vid) {
+      const prev = await env.DB.prepare("SELECT id FROM events WHERE type='page_view' AND vid=? AND ts>? LIMIT 1").bind(vid, now() - 1800).first();
+      if (prev) { dup = true; fire = false; capi = "repeat"; }
+    }
   }
   if (fire) {
     try { await sendCapi(s, { name: evName, eventId, ip, ua, fbp: b.fbp, fbc: b.fbc, url: b.url, extId: vid, test: false }); capi = "sent"; }
     catch (e) { capi = "error:" + String(e.message).slice(0, 180); }
   }
-  await env.DB.prepare("INSERT INTO events(ts,type,vid,event_id,fbp,fbc,ip,ua,url,meta_event,capi_status,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-    .bind(now(), type, vid, eventId, b.fbp || null, b.fbc || null, ip, ua, b.url || null, fire ? evName : null, capi, JSON.stringify({ dup })).run();
-  return json({ ok: true, dup });
+  await env.DB.prepare("INSERT INTO events(ts,type,vid,event_id,fbp,fbc,ip,ua,url,meta_event,capi_status,note,country,net,asn,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .bind(now(), logType, vid, eventId, b.fbp || null, b.fbc || null, ip, ua, b.url || null, fire ? evName : null, capi, note, g.country, g.net, g.asn, JSON.stringify({ dup })).run();
+  return json({ ok: true, dup, blocked: logType === "blocked_click" });
+}
+
+// ===== claim webhook: DApp/bot calls this on a real claim -> fire the Lead (matched to the ad click) =====
+async function hookClaim(request, env) {
+  const s = await allSettings(env);
+  if (!s.hook_secret) return json({ ok: false, error: "webhook not set up: generate a secret in admin Settings" }, 400);
+  let b; try { b = await request.json(); } catch (e) { b = {}; }
+  const secret = String(b.secret || request.headers.get("x-aureus-secret") || "");
+  if (secret !== s.hook_secret) return json({ ok: false, error: "bad secret" }, 401);
+  const wallet = String(b.wallet || b.address || "").trim();
+  if (!isAddr(wallet)) return json({ ok: false, error: "bad wallet" }, 400);
+  const addr = wallet.toLowerCase();
+  const ref = String(b.ref || "").trim() || null;
+  if (!s.pixel_id || !s.capi_token) return json({ ok: false, error: "pixel/capi not configured" }, 400);
+
+  const already = await env.DB.prepare("SELECT id FROM events WHERE type='claim' AND address=? AND capi_status='sent'").bind(addr).first();
+  if (already) return json({ ok: true, duplicate: true });
+
+  const windowSec = Number(s.claim_window_minutes || 30) * 60;
+  let click = null;
+  if (ref) click = await env.DB.prepare("SELECT * FROM events WHERE type='cta_click' AND vid=? ORDER BY (fbc IS NOT NULL) DESC, id DESC LIMIT 1").bind(ref).first();
+  if (!click) click = await env.DB.prepare("SELECT * FROM events WHERE type='cta_click' AND matched=0 AND ts>? ORDER BY id DESC LIMIT 1").bind(now() - windowSec).first();
+
+  const out = {};
+  const host = new URL(request.url).host;
+  const leadEv = s.ev_cta_click || "Lead";
+  const eid = "claim-" + addr.slice(2, 10) + "-" + Date.now();
+  let capi = "skipped";
+  try {
+    await sendCapi(s, { name: leadEv, eventId: eid, ip: click ? click.ip : undefined, ua: click ? click.ua : undefined, fbp: click ? click.fbp : undefined, fbc: click ? click.fbc : undefined, url: "https://" + host + "/", extId: addr, test: false });
+    capi = "sent"; out.lead = leadEv;
+  } catch (e) { capi = "error:" + String(e.message).slice(0, 180); out.error = e.message; }
+
+  if (s.hook_also_registration === "1" && s.ev_registration) {
+    try { await sendCapi(s, { name: s.ev_registration, eventId: "reg-" + eid, ip: click ? click.ip : undefined, ua: click ? click.ua : undefined, fbp: click ? click.fbp : undefined, fbc: click ? click.fbc : undefined, url: "https://" + host + "/", extId: addr, test: false }); out.registration = s.ev_registration; }
+    catch (e) { out.registration_error = String(e.message).slice(0, 120); }
+  }
+
+  await env.DB.prepare("INSERT INTO events(ts,type,address,vid,event_id,fbp,fbc,ip,ua,url,meta_event,capi_status,matched,click_id,country,net,asn,note,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    .bind(now(), "claim", addr, click ? click.vid : ref, eid, click ? click.fbp : null, click ? click.fbc : null, click ? click.ip : null, click ? click.ua : null, "https://" + host + "/", capi === "sent" ? leadEv : null, capi, click ? 1 : 0, click ? click.id : null, click ? click.country : null, click ? click.net : null, click ? click.asn : null, ref ? "ref" : (click ? "time-match" : "no-click"), JSON.stringify(out)).run();
+  if (click && capi === "sent") await env.DB.prepare("UPDATE events SET matched=1 WHERE type='cta_click' AND (id=? OR (vid IS NOT NULL AND vid=?))").bind(click.id, click.vid || "").run();
+  return json({ ok: capi === "sent", status: capi, matched: click ? (ref ? "by ref" : "by time") : "no click found", ...out });
 }
 
 async function sendCapi(s, o) {
@@ -142,21 +221,23 @@ async function admin(path, request, env) {
   }
   if (path === "/stats") {
     const q = sql => env.DB.prepare(sql).first().then(r => r.n);
-    const [pv, cc, uniq, leads, reg, regErr, pending, capiErr] = await Promise.all([
+    const [pv, cc, uniq, leads, reg, claims, regErr, pending, capiErr, blocked] = await Promise.all([
       q("SELECT COUNT(*) n FROM events WHERE type='page_view'"),
       q("SELECT COUNT(*) n FROM events WHERE type='cta_click'"),
       q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='page_view' AND vid IS NOT NULL"),
       q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='cta_click' AND vid IS NOT NULL"),
       q("SELECT COUNT(*) n FROM events WHERE type='registration' AND capi_status='sent'"),
+      q("SELECT COUNT(DISTINCT address) n FROM events WHERE type='claim' AND capi_status='sent'"),
       q("SELECT COUNT(*) n FROM events WHERE type='registration' AND capi_status LIKE 'error%'"),
       q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='cta_click' AND ts>" + (now() - 86400) + " AND vid NOT IN (SELECT vid FROM events WHERE type='cta_click' AND matched=1)"),
-      q("SELECT COUNT(*) n FROM events WHERE capi_status LIKE 'error%'")]);
-    return json({ page_view: pv, cta_click: cc, unique_visitors: uniq, leads, registrations: reg, registration_errors: regErr, pending_clicks: pending, capi_errors: capiErr, total_display: Number(s.claims_base || 0) + reg, max_claims: Number(s.max_claims || 500) });
+      q("SELECT COUNT(*) n FROM events WHERE capi_status LIKE 'error%'"),
+      q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='blocked_click' AND (note IS NULL OR note<>'meta_review')")]);
+    return json({ page_view: pv, cta_click: cc, unique_visitors: uniq, leads, blocked, registrations: reg, claims, registration_errors: regErr, pending_clicks: pending, capi_errors: capiErr, lead_on_claim: s.lead_on_claim === "1", total_display: Number(s.claims_base || 0) + reg + claims, max_claims: Number(s.max_claims || 500) });
   }
   if (path === "/events") {
     const u = new URL(request.url);
     const type = u.searchParams.get("type"), limit = Math.min(500, Number(u.searchParams.get("limit") || 100)), before = Number(u.searchParams.get("before") || 0);
-    let sql = "SELECT id,ts,type,address,vid,event_id,fbp,fbc,ip,meta_event,capi_status,matched,click_id,note FROM events WHERE 1=1"; const args = [];
+    let sql = "SELECT id,ts,type,address,vid,event_id,fbp,fbc,ip,meta_event,capi_status,matched,click_id,note,country,net FROM events WHERE 1=1"; const args = [];
     if (type) { sql += " AND type=?"; args.push(type); }
     if (before) { sql += " AND id<?"; args.push(before); }
     sql += " ORDER BY id DESC LIMIT ?"; args.push(limit);
@@ -168,24 +249,26 @@ async function admin(path, request, env) {
     const u = new URL(request.url);
     const qs = (u.searchParams.get("q") || "").trim().toLowerCase();
     const limit = Math.min(500, Number(u.searchParams.get("limit") || 100)), offset = Number(u.searchParams.get("offset") || 0);
-    let where = "type='cta_click' AND vid IS NOT NULL"; const args = [];
-    if (qs) { where += " AND (lower(vid) LIKE ? OR ip LIKE ?)"; args.push("%" + qs + "%", "%" + qs + "%"); }
-    const sql = `SELECT vid, MIN(ts) first_ts, MAX(ts) last_ts, COUNT(*) clicks, MAX(ip) ip, MAX(fbc) fbc, MAX(fbp) fbp, MAX(matched) matched, MIN(id) first_id, MAX(CASE WHEN capi_status='sent' THEN 1 ELSE 0 END) capi_sent FROM events WHERE ${where} GROUP BY vid ORDER BY last_ts DESC`;
+    const kind = u.searchParams.get("kind") === "blocked" ? "blocked_click" : "cta_click";
+    let where = `type='${kind}' AND vid IS NOT NULL`; const args = [];
+    if (kind === "blocked_click") where += " AND (note IS NULL OR note<>'meta_review')";
+    if (qs) { where += " AND (lower(vid) LIKE ? OR ip LIKE ? OR lower(country) LIKE ? OR lower(net) LIKE ?)"; args.push("%" + qs + "%", "%" + qs + "%", "%" + qs + "%", "%" + qs + "%"); }
+    const sql = `SELECT vid, MIN(ts) first_ts, MAX(ts) last_ts, COUNT(*) clicks, MAX(ip) ip, MAX(fbc) fbc, MAX(fbp) fbp, MAX(matched) matched, MIN(id) first_id, SUM(CASE WHEN capi_status='sent' THEN 1 ELSE 0 END) leads_sent, MAX(country) country, MAX(net) net, MAX(ua) ua, MAX(note) note FROM events WHERE ${where} GROUP BY vid ORDER BY last_ts DESC`;
     if (path === "/leads.csv") {
       const { results } = await env.DB.prepare(sql).bind(...args).all();
-      const head = "first_click_ist,last_click_ist,visitor_id,clicks,ip,has_fbc,fired_to_meta\n";
+      const head = "first_click_ist,last_click_ist,visitor_id,clicks,ip,country,network,browser,has_fbc,leads_sent_to_meta,registration_fired,block_reason\n";
       const ist = t => new Date(t * 1000).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
-      const rows = results.map(r => [ist(r.first_ts), ist(r.last_ts), r.vid, r.clicks, r.ip, r.fbc ? 1 : 0, r.matched ? 1 : 0].map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+      const rows = results.map(r => [ist(r.first_ts), ist(r.last_ts), r.vid, r.clicks, r.ip, r.country, r.net, browserOf(r.ua), r.fbc ? 1 : 0, r.leads_sent, r.matched ? 1 : 0, kind === "blocked_click" ? r.note : ""].map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
       return new Response(head + rows, { headers: { "content-type": "text/csv", "content-disposition": "attachment; filename=aureus-leads.csv" } });
     }
     const total = await env.DB.prepare(`SELECT COUNT(DISTINCT vid) n FROM events WHERE ${where}`).bind(...args).first();
     const { results } = await env.DB.prepare(sql + " LIMIT ? OFFSET ?").bind(...args, limit, offset).all();
-    return json({ total: total.n, rows: results.map(r => ({ vid: r.vid, first_ts: r.first_ts, last_ts: r.last_ts, clicks: r.clicks, ip: r.ip, has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched, first_id: r.first_id })) });
+    return json({ total: total.n, rows: results.map(r => ({ vid: r.vid, first_ts: r.first_ts, last_ts: r.last_ts, clicks: r.clicks, ip: r.ip, country: r.country, net: r.net, browser: browserOf(r.ua), has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched, first_id: r.first_id, leads_sent: r.leads_sent, reason: r.note })) });
   }
   // recent CTA clicks for the Fire tab (to attach ad-click data to a manual registration)
   if (path === "/clicks") {
-    const { results } = await env.DB.prepare("SELECT MIN(id) id, MIN(ts) ts, MAX(ts) last_ts, COUNT(*) clicks, vid, MAX(ip) ip, MAX(fbp) fbp, MAX(fbc) fbc, MAX(matched) matched FROM events WHERE type='cta_click' AND vid IS NOT NULL GROUP BY vid ORDER BY last_ts DESC LIMIT 40").all();
-    return json(results.map(r => ({ id: r.id, ts: r.ts, last_ts: r.last_ts, clicks: r.clicks, vid: r.vid, ip: r.ip, has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched })));
+    const { results } = await env.DB.prepare("SELECT MIN(id) id, MIN(ts) ts, MAX(ts) last_ts, COUNT(*) clicks, vid, MAX(ip) ip, MAX(fbp) fbp, MAX(fbc) fbc, MAX(matched) matched, MAX(country) country FROM events WHERE type='cta_click' AND vid IS NOT NULL GROUP BY vid ORDER BY last_ts DESC LIMIT 40").all();
+    return json(results.map(r => ({ id: r.id, ts: r.ts, last_ts: r.last_ts, clicks: r.clicks, vid: r.vid, ip: r.ip, country: r.country, has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched })));
   }
   if (path === "/export.csv") {
     const { results } = await env.DB.prepare("SELECT ts,type,address,vid,event_id,fbp,fbc,ip,meta_event,capi_status,matched,click_id,note FROM events ORDER BY id").all();
@@ -307,6 +390,18 @@ const LANDING_HTML = String.raw`<!doctype html>
   .btn[disabled],.btn.off{opacity:.55;cursor:not-allowed;transform:none!important;pointer-events:none}
   .hint{margin-top:12px;font-size:12px;color:var(--mut);display:flex;align-items:center;justify-content:center;gap:7px}
   .hint .tw{width:16px;height:16px;border-radius:4px;background:#0500ff;display:inline-block;background:linear-gradient(135deg,#3375BB,#0B5FD0)}
+  .sheet-bg{position:fixed;inset:0;background:rgba(5,3,12,0.72);backdrop-filter:blur(4px);z-index:50;display:none;align-items:flex-end;justify-content:center}
+  .sheet-bg.on{display:flex}
+  .sheet{width:100%;max-width:470px;background:#110b22;border:1px solid var(--brd);border-bottom:none;border-radius:22px 22px 0 0;padding:22px 22px 28px;box-shadow:0 -20px 60px rgba(40,10,90,0.6);animation:up .28s cubic-bezier(.2,.8,.2,1)}
+  @keyframes up{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
+  .sheet h4{font-family:var(--font-d);font-size:19px;font-weight:600;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+  .sheet h4 button{background:none;border:none;color:var(--mut);font-size:22px;cursor:pointer;line-height:1}
+  .sheet p{font-size:13.5px;color:var(--mut);line-height:1.6;margin-bottom:14px}
+  .sheet .btn{margin-bottom:10px}
+  .sheet .btn2{display:block;width:100%;text-align:center;background:rgba(255,255,255,0.05);border:1px solid var(--brd);color:var(--ink);font-family:var(--font-d);font-size:14px;font-weight:500;padding:14px;border-radius:13px;cursor:pointer;text-decoration:none;margin-bottom:10px}
+  .sheet .tip{font-size:12.5px;color:#C9C2E8;background:rgba(124,77,255,0.08);border:1px solid rgba(124,77,255,0.2);border-radius:12px;padding:12px 14px;line-height:1.55;margin-top:4px}
+  .sheet .small{font-size:12px;color:var(--mut2);text-align:center;margin-top:12px}
+  .sheet .small a{color:var(--v3)}
   .meter{margin-top:18px}
   .mt{display:flex;justify-content:space-between;font-size:11.5px;color:var(--mut);margin-bottom:8px}
   .mt b{font-family:var(--font-d);color:#C9C2E8;font-weight:600}
@@ -451,10 +546,14 @@ const LANDING_HTML = String.raw`<!doctype html>
     </footer>
   </div>
 </main>
+<div class="sheet-bg" id="sheetBg"><div class="sheet" id="sheet"></div></div>
 <script>
 (function(){
   var $=function(id){return document.getElementById(id)};
-  var CFG=null, target='';
+  var CFG=null, target='', rawLink='';
+  var UA=navigator.userAgent||'';
+  var IS_ANDROID=/Android/i.test(UA), IS_IOS=/iPhone|iPad|iPod/i.test(UA), IS_MOBILE=IS_ANDROID||IS_IOS;
+  var IN_APP=/FBAN|FBAV|FB_IAB|FBIOS|Instagram|Messenger/i.test(UA);
 
   // ---------- visitor id (stays same across visits; forwarded to the DApp as ?ref=) ----------
   function uid(){return (crypto.randomUUID?crypto.randomUUID():('e'+Date.now()+Math.random()))}
@@ -470,10 +569,12 @@ const LANDING_HTML = String.raw`<!doctype html>
   function track(type){
     var eid=uid();
     var evName=CFG&&CFG['ev_'+type];
-    // Lead (claim click) goes to the pixel only ONCE per visitor; repeat clicks are logged server-side as duplicates
-    var pixelOk = type!=='cta_click' || !flag('aur_lead_'+VID);
+    // Lead (claim click) goes to the pixel only ONCE per visitor; PageView once per 30 min; blocked visitors never send Lead
+    var pixelOk=true;
+    if(type==='cta_click')pixelOk=!flag('aur_lead_'+VID)&&CFG&&CFG.allowed!==false;
+    if(type==='page_view'){var last=0;try{last=Number(localStorage.getItem('aur_pv_ts')||0)}catch(e){}pixelOk=(Date.now()-last)>1800000;try{localStorage.setItem('aur_pv_ts',String(Date.now()))}catch(e){}}
     if(window.fbq&&evName&&CFG.pixel_id&&pixelOk){try{fbq('track',evName,{},{eventID:eid});}catch(e){}}
-    if(type==='cta_click')setFlag('aur_lead_'+VID);
+    if(type==='cta_click'&&CFG&&CFG.allowed!==false)setFlag('aur_lead_'+VID);
     var body=JSON.stringify({type:type,event_id:eid,vid:VID,fbp:cookie('_fbp'),fbc:fbc(),url:location.href});
     var sent=false;
     if(navigator.sendBeacon){try{sent=navigator.sendBeacon('/api/event',new Blob([body],{type:'application/json'}))}catch(e){}}
@@ -491,9 +592,41 @@ const LANDING_HTML = String.raw`<!doctype html>
     var u=c.dapp_link||'';
     if(!u)return '';
     if(c.append_ref==='1'){u+=(u.indexOf('?')>-1?'&':'?')+'ref='+encodeURIComponent(VID);}
-    // already inside a wallet DApp browser → open directly; else → Trust Wallet deep link
-    if(c.trust_deeplink==='1'&&!inWallet())return 'https://link.trustwallet.com/open_url?coin_id=20000714&url='+encodeURIComponent(u);
-    return u;
+    rawLink=u;
+    if(c.trust_deeplink!=='1'||inWallet())return u;            // already inside a wallet browser → open directly
+    var uni='https://link.trustwallet.com/open_url?coin_id=20000714&url='+encodeURIComponent(u);
+    // Android: intent:// opens the Trust Wallet app even from Facebook/Instagram in-app browser; falls back to the universal link
+    if(IS_ANDROID)return 'intent://open_url?coin_id=20000714&url='+encodeURIComponent(u)+'#Intent;scheme=trust;package=com.wallet.crypto.trustapp;S.browser_fallback_url='+encodeURIComponent(uni)+';end';
+    return uni;
+  }
+
+  // ---------- bottom sheets ----------
+  function closeSheet(){$('sheetBg').classList.remove('on')}
+  function openSheet(h){$('sheet').innerHTML=h;$('sheetBg').classList.add('on');var x=$('shX');if(x)x.onclick=closeSheet}
+  $('sheetBg').addEventListener('click',function(e){if(e.target.id==='sheetBg')closeSheet()});
+  function copy(t,btn){
+    function done(){if(btn){btn.textContent='Copied ✓';setTimeout(function(){btn.textContent='Copy claim link'},2000)}}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(done,function(){fallback()})}else fallback();
+    function fallback(){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{document.execCommand('copy');done()}catch(e){}document.body.removeChild(a)}
+  }
+  function helpSheet(back){
+    var chrome=IS_ANDROID&&IN_APP?'<a class="btn2" href="intent://'+location.host+location.pathname+location.search+'#Intent;scheme=https;package=com.android.chrome;end">Open this page in Chrome</a>':'';
+    var tip=IN_APP?'<div class="tip">You’re inside the '+(/Instagram/i.test(UA)?'Instagram':'Facebook')+' browser, which sometimes blocks wallet apps. Tap <b>⋮</b> (top right) → <b>Open in '+(IS_IOS?'Safari':'browser')+'</b>, then tap Claim now again.</div>'
+      :'<div class="tip">Or open <b>Trust Wallet</b> → <b>Browser</b> tab → paste the copied link.</div>';
+    if(!IS_MOBILE)tip='<div class="tip">Claiming works on your phone. Open this page on your phone, or paste the copied link into the browser inside <b>Trust Wallet</b>.</div>';
+    openSheet('<h4>'+(back?'Didn’t reach the claim page?':'Opening Trust Wallet…')+'<button id="shX" aria-label="Close">×</button></h4>'
+      +'<p>'+(back?'No problem — pick one of these:':'If nothing opened in a couple of seconds, use one of these:')+'</p>'
+      +(IS_MOBILE?'<a class="btn" href="'+target+'" id="shRetry">Open in Trust Wallet</a>':'')
+      +chrome
+      +'<button class="btn2" id="shCopy">Copy claim link</button>'
+      +tip
+      +'<div class="small">No Trust Wallet yet? <a href="https://trustwallet.com/download" target="_blank" rel="noopener">Get it free</a> · keep '+(CFG&&CFG.gas_fee_text||'~$0.10 in BNB')+' for the fee</div>');
+    $('shCopy').onclick=function(){copy(rawLink,this)};
+  }
+  function blockedSheet(reason){
+    openSheet('<h4>Not available on this connection<button id="shX" aria-label="Close">×</button></h4>'
+      +(reason==='vpn'?'<p>It looks like you’re using a VPN, proxy or cloud network. To keep the airdrop fair, claims only work on a normal mobile or home connection.</p><div class="tip">Turn off your VPN / proxy, then reload this page.</div>'
+        :'<p>This airdrop is open to wallets in India only.</p><div class="tip">If you’re in India and using a VPN, turn it off and reload this page.</div>'));
   }
   function setOff(txt){[$('mainBtn'),$('btn2')].forEach(function(b){b.textContent=txt;b.classList.add('off');b.removeAttribute('href')});$('hint').style.display='none'}
 
@@ -513,21 +646,36 @@ const LANDING_HTML = String.raw`<!doctype html>
         fbq('init',c.pixel_id,{external_id:VID});
       }
       track('page_view');
-      target=buildTarget(c);
       if(c.claims_open!=='1'){setOff('Claims paused');return}
       if(c.remaining!==undefined&&c.remaining<=0){setOff('All spots claimed');return}
+      if(c.allowed===false)return;                  // button stays; tap explains why (no link exposed)
+      target=buildTarget(c);
       if(!target){setOff('Opening soon');return}
       [$('mainBtn'),$('btn2')].forEach(function(b){b.href=target});
       if(inWallet()){$('hint').innerHTML='Opens the claim app · takes 30 seconds'}
+      // came back within 20 min of tapping Claim (wallet didn't open / they bounced) → offer help right away
+      var lc=0;try{lc=Number(localStorage.getItem('aur_click_ts')||0)}catch(e){}
+      if(lc&&Date.now()-lc<1200000&&!inWallet())setTimeout(function(){helpSheet(true)},600);
     });
   }
 
+  var tapped=0;
   function go(ev){
+    if(!CFG)return;
+    if(CFG.allowed===false){ev.preventDefault();track('cta_click');blockedSheet(CFG.block_reason);return}
     if(!target)return;
     ev.preventDefault();
     track('cta_click');
+    try{localStorage.setItem('aur_click_ts',String(Date.now()))}catch(e){}
+    if(!IS_MOBILE&&!inWallet()){helpSheet(false);return}   // desktop without a wallet extension
+    tapped=Date.now();
     setTimeout(function(){location.href=target},180);
+    // still on this page 2.5s later → the wallet app didn't open
+    setTimeout(function(){if(document.visibilityState==='visible'&&Date.now()-tapped<4000)helpSheet(false)},2500);
   }
+  document.addEventListener('visibilitychange',function(){
+    if(document.visibilityState==='visible'&&tapped&&Date.now()-tapped>4000&&Date.now()-tapped<1200000&&!$('sheetBg').classList.contains('on'))helpSheet(true);
+  });
   $('mainBtn').addEventListener('click',go);
   $('btn2').addEventListener('click',go);
 
@@ -584,6 +732,11 @@ const ADMIN_HTML = String.raw`<!doctype html>
   .t-page_view{background:rgba(255,255,255,0.08);color:var(--mut)}
   .t-cta_click{background:rgba(108,229,255,0.12);color:var(--cyan)}
   .t-registration{background:rgba(155,240,201,0.15);color:var(--ok)}
+  .t-blocked_click{background:rgba(255,157,176,0.12);color:var(--err)}
+  .t-claim{background:rgba(155,240,201,0.22);color:var(--ok)}
+  .seg{display:inline-flex;border:1px solid var(--brd);border-radius:30px;overflow:hidden}
+  .seg button{font-family:var(--fb);font-size:12px;color:var(--mut);background:none;border:none;padding:8px 14px;cursor:pointer}
+  .seg button.on{background:var(--v1);color:#fff}
   .ok{color:var(--ok)}.err{color:var(--err)}.mut{color:var(--mut2)}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
   input,select,textarea{background:rgba(255,255,255,0.05);border:1px solid var(--brd);color:var(--ink);font-family:var(--fb);font-size:13px;padding:10px 12px;border-radius:10px;outline:none;width:100%}
@@ -675,7 +828,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
   <div class="card">
     <h3>Funnel <small>all time</small></h3>
     <div class="funnel" id="funnel"></div>
-    <div class="flab"><div>Page views</div><div>Leads (unique)</div><div>Registrations fired</div></div>
+    <div class="flab"><div>Visitors</div><div>Claim taps</div><div>Leads to Meta</div></div>
   </div>
   <div class="card">
     <h3>Live feed <small>latest 30 · auto-refresh 10s</small></h3>
@@ -686,14 +839,15 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <!-- ============ LEADS ============ -->
 <div class="panel" id="p-leads">
   <div class="card">
-    <h3>Leads <small>unique visitors who tapped "Claim now" · one row per person</small></h3>
+    <h3>Leads <small>one row per person · each person sends Meta at most 1 Lead</small></h3>
     <div class="row">
-      <input id="lq" placeholder="search ref or IP" style="width:220px">
+      <div class="seg"><button class="on" id="kReal" onclick="setKind('')">Real leads</button><button id="kBlk" onclick="setKind('blocked')">Blocked (VPN / outside India)</button></div>
+      <input id="lq" placeholder="search ref, IP, country, network" style="width:240px">
       <button class="btn sm sec" onclick="loadLeads(0)">Search</button>
-      <a class="btn sm" href="/api/admin/leads.csv" style="text-decoration:none">Export CSV</a>
+      <a class="btn sm" id="lCsv" href="/api/admin/leads.csv" style="text-decoration:none">Export CSV</a>
       <span class="pill" id="lCount"></span>
     </div>
-    <div style="overflow:auto"><table><thead><tr><th>#</th><th>First click (IST)</th><th>Last click</th><th>Clicks</th><th>Ref</th><th>IP</th><th>fbc</th><th>Fired</th><th></th></tr></thead><tbody id="lBody"></tbody></table></div>
+    <div style="overflow:auto"><table><thead><tr><th>#</th><th>First click (IST)</th><th>Last click</th><th>Clicks</th><th>Meta Leads</th><th>Country</th><th>Network</th><th>Browser</th><th>IP</th><th>fbc</th><th>Fired</th><th></th></tr></thead><tbody id="lBody"></tbody></table></div>
     <div class="row" style="margin-top:12px"><button class="btn sm sec" onclick="loadLeads(lOff-100)">← Prev</button><button class="btn sm sec" onclick="loadLeads(lOff+100)">Next →</button><span class="mut" id="lPage" style="font-size:12px"></span></div>
   </div>
 </div>
@@ -702,7 +856,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
 <div class="panel" id="p-events">
   <div class="card">
     <div class="row">
-      <select id="fType" style="width:auto"><option value="">All events</option><option>page_view</option><option>cta_click</option><option>registration</option></select>
+      <select id="fType" style="width:auto"><option value="">All events</option><option>page_view</option><option>cta_click</option><option>claim</option><option>blocked_click</option><option>registration</option></select>
       <button class="btn sm sec" onclick="loadEvents()">Refresh</button>
       <button class="btn sm sec" onclick="loadMore()">Load older</button>
       <a class="btn sm" href="/api/admin/export.csv" style="text-decoration:none">Export CSV</a>
@@ -720,6 +874,25 @@ const ADMIN_HTML = String.raw`<!doctype html>
     <div class="toggle"><input type="checkbox" data-k="trust_deeplink" data-bool> Open through Trust Wallet deep link when user is in a normal browser (inside a wallet browser it opens directly)</div>
     <div class="toggle"><input type="checkbox" data-k="append_ref" data-bool> Append <code>?ref=&lt;visitor id&gt;</code> to the link (if your DApp forwards it in the claim message, paste it in Fire tab for exact matching)</div>
     <div class="toggle"><input type="checkbox" data-k="claims_open" data-bool> Claims open (off = button shows "Claims paused")</div>
+  </div>
+  <div class="card">
+    <h3>Anti-farming</h3>
+    <div class="f"><label>Allowed countries <span class="mut">(2-letter codes, comma separated · empty = everyone)</span></label><input data-k="allowed_countries" placeholder="IN"></div>
+    <div class="toggle"><input type="checkbox" data-k="block_hosting" data-bool> Block VPN / proxy / datacenter networks (AWS, Google Cloud, M247, Hetzner…)</div>
+    <div class="note">Blocked visitors still see the page (so Meta's ad review passes), but tapping Claim shows a message instead of the DApp link. They are logged as <code>blocked_click</code>, never counted as a Lead and never sent to Meta. Meta's own review bot is recognised and let through.</div>
+  </div>
+  <div class="card">
+    <h3>Claim webhook <small>fire the Lead only when a real claim happens</small></h3>
+    <div class="toggle"><input type="checkbox" data-k="lead_on_claim" data-bool> <b style="margin-left:4px">Only send Lead to Meta on a confirmed claim</b> (off = Lead fires on every click)</div>
+    <div class="note" style="margin:4px 0 12px">When on, tapping "Claim now" is just logged — the Lead goes to Meta only when your DApp or Telegram bot calls the webhook below with the wallet. Far higher quality: Meta learns from real claimers, not clickers.</div>
+    <div class="f"><label>Webhook URL <span class="mut">(your DApp/bot POSTs here on claim)</span></label><input id="hookUrl" readonly onclick="this.select()"></div>
+    <div class="cols">
+      <div class="f"><label>Webhook secret</label><input data-k="hook_secret" placeholder="click Generate"></div>
+      <div class="f"><label>Match window (minutes)</label><input data-k="claim_window_minutes" placeholder="30"></div>
+    </div>
+    <div class="toggle"><input type="checkbox" data-k="hook_also_registration" data-bool> Also fire CompleteRegistration on claim (for the lookalike seed)</div>
+    <div class="row" style="margin-top:8px"><button class="btn sm sec" onclick="genSecret()">Generate secret</button><button class="btn sm sec" onclick="showHookHelp()">How to connect my DApp / bot</button></div>
+    <div class="note" id="hookHelp" style="display:none;margin-top:10px"></div>
   </div>
   <div class="card">
     <h3>Page text &amp; counters</h3>
@@ -791,7 +964,7 @@ document.querySelectorAll('.tabs button[data-t]').forEach(function(b){b.addEvent
 function ist(ts){return new Date(ts*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false,day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 function sh(a){return a?'<span title="'+a+'">'+a.slice(0,6)+'…'+a.slice(-4)+'</span>':'<span class="mut">—</span>'}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function capiCell(s){if(!s)return'';if(s==='sent')return'<span class="ok">sent</span>';if(s==='dup')return'<span class="mut" title="repeat click, not re-sent">dup</span>';if(s==='skipped')return'<span class="mut">—</span>';return'<span class="err" title="'+esc(s)+'">error</span>'}
+function capiCell(s){if(!s)return'';if(s==='sent')return'<span class="ok">sent</span>';if(s==='dup'||s==='repeat')return'<span class="mut" title="same person again — NOT sent to Meta">repeat</span>';if(s==='blocked')return'<span class="err" title="VPN / outside allowed country — NOT sent to Meta">blocked</span>';if(s==='held')return'<span class="mut" title="waiting for claim confirmation from your bot/DApp">held</span>';if(s==='skipped')return'<span class="mut">—</span>';return'<span class="err" title="'+esc(s)+'">error</span>'}
 function rowHtml(e,withIp){
   return '<tr><td>'+ist(e.ts)+'</td><td><span class="tag t-'+e.type+'">'+e.type.replace('_',' ')+'</span></td><td>'+sh(e.address)+'</td><td>'+(e.vid?'<span class="mut">'+esc(e.vid).slice(0,8)+'</span>':'<span class="mut">—</span>')+'</td><td>'+(e.meta_event||'<span class="mut">—</span>')+'</td><td>'+capiCell(e.capi_status)+'</td><td>'+(withIp?esc(e.ip||''):(e.fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>'))+'</td>'+(withIp?'<td>'+esc(e.note||'')+'</td>':'')+'</tr>';
 }
@@ -800,9 +973,9 @@ function rowHtml(e,withIp){
 function loadFire(){
   api('/clicks').then(function(cl){
     var sel=$('fMatch'),cur=sel.value;
-    sel.innerHTML='<option value="auto">Auto — latest unmatched click</option><option value="none">None — wallet only</option>'+cl.map(function(c){return'<option value="click:'+c.id+'">'+ist(c.last_ts||c.ts)+' · '+(c.ip||'')+(c.has_fbc?' · fbc✓':'')+(c.matched?' · used':'')+'</option>'}).join('');
+    sel.innerHTML='<option value="auto">Auto — latest unmatched click</option><option value="none">None — wallet only</option>'+cl.map(function(c){return'<option value="click:'+c.id+'">'+ist(c.last_ts||c.ts)+' · '+(c.country||'??')+' · '+(c.ip||'')+(c.has_fbc?' · fbc✓':'')+(c.matched?' · used':'')+'</option>'}).join('');
     sel.value=cur||'auto';
-    $('clicks').innerHTML=cl.length?cl.map(function(c){return'<tr><td>'+ist(c.last_ts||c.ts)+(c.clicks>1?' <span class="mut">×'+c.clicks+'</span>':'')+'</td><td class="mut">'+esc(c.vid||'').slice(0,8)+'</td><td>'+esc(c.ip||'')+'</td><td>'+(c.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(c.matched?'<span class="mut">used</span>':'<span class="ok">free</span>')+'</td><td><button class="btn sm sec" onclick="pick('+c.id+')">use</button></td></tr>'}).join(''):'<tr><td colspan="6" class="mut">No clicks yet.</td></tr>';
+    $('clicks').innerHTML=cl.length?cl.map(function(c){return'<tr><td>'+ist(c.last_ts||c.ts)+(c.clicks>1?' <span class="mut">×'+c.clicks+'</span>':'')+'</td><td class="mut">'+esc(c.vid||'').slice(0,8)+'</td><td>'+(c.country?esc(c.country)+' · ':'')+esc(c.ip||'')+'</td><td>'+(c.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(c.matched?'<span class="mut">used</span>':'<span class="ok">free</span>')+'</td><td><button class="btn sm sec" onclick="pick('+c.id+')">use</button></td></tr>'}).join(''):'<tr><td colspan="6" class="mut">No clicks yet.</td></tr>';
   }).catch(function(){});
   api('/events?type=registration&limit=20').then(function(ev){
     $('fired').innerHTML=ev.length?ev.map(function(e){return'<tr><td>'+ist(e.ts)+'</td><td>'+sh(e.address)+'</td><td>'+(e.meta_event||'')+'</td><td>'+capiCell(e.capi_status)+'</td><td>'+(e.click_id?'<span class="ok">#'+e.click_id+'</span>':'<span class="mut">none</span>')+'</td><td>'+esc(e.note||'')+'</td></tr>'}).join(''):'<tr><td colspan="6" class="mut">Nothing fired yet.</td></tr>';
@@ -825,13 +998,14 @@ function fire(){
 }
 
 // ---- Leads ----
-var lOff=0;
+var lOff=0, lKind='';
+function setKind(k){lKind=k;$('kReal').classList.toggle('on',!k);$('kBlk').classList.toggle('on',!!k);$('lCsv').href='/api/admin/leads.csv'+(k?'?kind=blocked':'');loadLeads(0)}
 function loadLeads(off){
   lOff=Math.max(0,off||0);
-  api('/leads?limit=100&offset='+lOff+'&q='+encodeURIComponent($('lq').value.trim())).then(function(j){
-    $('lCount').textContent=j.total+' leads';
+  api('/leads?limit=100&offset='+lOff+(lKind?'&kind='+lKind:'')+'&q='+encodeURIComponent($('lq').value.trim())).then(function(j){
+    $('lCount').textContent=j.total+(lKind?' blocked':' leads');
     $('lPage').textContent=(lOff+1)+'–'+Math.min(lOff+100,j.total)+' of '+j.total;
-    $('lBody').innerHTML=j.rows.length?j.rows.map(function(r,i){return'<tr><td class="mut">'+(lOff+i+1)+'</td><td>'+ist(r.first_ts)+'</td><td>'+ist(r.last_ts)+'</td><td>'+(r.clicks>1?'<span style="color:#F5C97A">'+r.clicks+'</span>':r.clicks)+'</td><td class="mut">'+esc(r.vid).slice(0,8)+'</td><td>'+esc(r.ip||'')+'</td><td>'+(r.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(r.matched?'<span class="ok">yes</span>':'<span class="mut">no</span>')+'</td><td><button class="btn sm sec" onclick="useLead('+r.first_id+')">fire</button></td></tr>'}).join(''):'<tr><td colspan="9" class="mut">No leads yet.</td></tr>';
+    $('lBody').innerHTML=j.rows.length?j.rows.map(function(r,i){return'<tr><td class="mut">'+(lOff+i+1)+'</td><td>'+ist(r.first_ts)+'</td><td>'+ist(r.last_ts)+'</td><td>'+(r.clicks>1?'<span style="color:#F5C97A">'+r.clicks+'</span>':r.clicks)+'</td><td>'+(lKind?'<span class="err">'+esc(r.reason||'')+'</span>':(r.leads_sent==1?'<span class="ok">1</span>':r.leads_sent>1?'<span style="color:#F5C97A" title="sent before the one-Lead-per-person fix">'+r.leads_sent+'</span>':'<span class="mut">0</span>'))+'</td><td>'+(r.country?esc(r.country):'<span class="mut">—</span>')+'</td><td style="max-width:170px;overflow:hidden;text-overflow:ellipsis">'+(r.net?esc(r.net):'<span class="mut">—</span>')+'</td><td>'+esc(r.browser||'')+'</td><td>'+esc(r.ip||'')+'</td><td>'+(r.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(r.matched?'<span class="ok">yes</span>':'<span class="mut">no</span>')+'</td><td>'+(lKind?'':'<button class="btn sm sec" onclick="useLead('+r.first_id+')">fire</button>')+'</td></tr>'}).join(''):'<tr><td colspan="12" class="mut">Nothing here yet.</td></tr>';
   }).catch(function(){});
 }
 function useLead(id){pick(id);document.querySelector('.tabs button[data-t=fire]').click()}
@@ -840,9 +1014,10 @@ $('lq').addEventListener('keydown',function(e){if(e.key==='Enter')loadLeads(0)})
 // ---- Dashboard ----
 function loadDash(){
   api('/stats').then(function(s){
-    var cards=[['Page views',s.page_view],['Leads (unique)',s.leads,s.cta_click+' total clicks · '+s.unique_visitors+' visitors'],['Registrations fired',s.registrations,s.registration_errors?s.registration_errors+' failed':'to Meta'],['Clicks pending',s.pending_clicks,'unmatched, last 24h'],['Counter on page',s.total_display+' / '+s.max_claims],['CAPI errors',s.capi_errors]];
+var leadNum=s.lead_on_claim?s.claims:s.leads;
+    var cards=[['Visitors (unique)',s.unique_visitors,s.page_view+' page loads'],['Claim taps',s.cta_click,s.unique_visitors+' visitors'],['Claims confirmed',s.claims,s.lead_on_claim?'Lead fires on these':'via bot webhook'],['Leads to Meta',leadNum,s.lead_on_claim?'on confirmed claim':'on click, 1/person'],['Blocked',s.blocked,'VPN / outside India'],['Registrations',s.registrations,s.registration_errors?s.registration_errors+' failed':'manual / lookalike'],['Counter on page',s.total_display+' / '+s.max_claims],['CAPI errors',s.capi_errors]];
     $('stats').innerHTML=cards.map(function(c){return'<div class="stat"><div class="k">'+c[0]+'</div><div class="v">'+(c[1]||0)+'</div>'+(c[2]?'<div class="s">'+c[2]+'</div>':'')+'</div>'}).join('');
-    var f=[s.page_view,s.leads,s.registrations],mx=Math.max.apply(null,f.concat([1]));
+var f=[s.unique_visitors,s.cta_click,leadNum],mx=Math.max.apply(null,f.concat([1]));
     $('funnel').innerHTML=f.map(function(v){return'<div class="fbar" style="height:'+Math.max(4,v/mx*100)+'%"><span>'+(v||0)+'</span></div>'}).join('');
   }).catch(function(){});
   api('/events?limit=30').then(function(ev){$('feed').innerHTML=ev.map(function(e){return rowHtml(e,false)}).join('')}).catch(function(){});
@@ -851,7 +1026,9 @@ function loadEvents(){oldest=0;var t=$('fType').value;api('/events?limit=100'+(t
 function loadMore(){if(!oldest)return;var t=$('fType').value;api('/events?limit=100&before='+oldest+(t?'&type='+t:'')).then(function(ev){$('evBody').innerHTML+=ev.map(function(e){return rowHtml(e,true)}).join('');if(ev.length)oldest=ev[ev.length-1].id})}
 
 // ---- Settings ----
-function loadSettings(){api('/settings').then(function(s){SET=s;document.querySelectorAll('[data-k]').forEach(function(el){var k=el.dataset.k;if(el.hasAttribute('data-bool'))el.checked=s[k]==='1';else el.value=s[k]||''});$('fEvent').placeholder=s.ev_registration||'CompleteRegistration'})}
+function loadSettings(){api('/settings').then(function(s){SET=s;document.querySelectorAll('[data-k]').forEach(function(el){var k=el.dataset.k;if(el.hasAttribute('data-bool'))el.checked=s[k]==='1';else el.value=s[k]||''});$('fEvent').placeholder=s.ev_registration||'CompleteRegistration';if($('hookUrl'))$('hookUrl').value=location.origin+'/api/hook/claim'})}
+function genSecret(){var a=new Uint8Array(24);crypto.getRandomValues(a);var h='';for(var i=0;i<a.length;i++)h+=('0'+a[i].toString(16)).slice(-2);document.querySelector('[data-k=hook_secret]').value=h;$('setMsg').textContent='Secret generated - click Save settings, then paste it in your DApp/bot.';$('setMsg').className='msg ok'}
+function showHookHelp(){var sec=document.querySelector('[data-k=hook_secret]').value||'YOUR_SECRET';var url=location.origin+'/api/hook/claim';var h=$('hookHelp');h.style.display=h.style.display==='none'?'block':'none';h.innerHTML='On a real claim, your DApp or Telegram bot sends one POST:<br><br><code style="display:block;white-space:pre-wrap;padding:10px;line-height:1.7">POST '+url+'\nContent-Type: application/json\n\n{"secret":"'+esc(sec)+'","wallet":"0xUSER_WALLET","ref":"VALUE_OF_ref_PARAM"}</code><br><b>ref</b> is the code we add to your claim link (<code>?ref=...</code>). If your DApp reads it and includes it, matching is exact. If not, leave <b>ref</b> out - we match the newest ad click within the window. Send it within a minute or two of the claim.'}
 function collect(){var o={};document.querySelectorAll('[data-k]').forEach(function(el){o[el.dataset.k]=el.hasAttribute('data-bool')?(el.checked?'1':'0'):el.value.trim()});return o}
 function saveSettings(){api('/settings',{method:'PUT',body:JSON.stringify(collect())}).then(function(j){var m=j.ok?'Saved.':'Error: '+j.error;['setMsg','metaMsg'].forEach(function(id){$(id).textContent=m;$(id).className='msg '+(j.ok?'ok':'err')});loadSettings();loadDash()})}
 function testCapi(){$('metaMsg').textContent='Sending…';api('/test-capi',{method:'POST',body:JSON.stringify({event:$('p-meta').querySelector('[data-k=ev_cta_click]').value||'Lead'})}).then(function(j){$('metaMsg').textContent=j.ok?'Sent. Check Events Manager → Test events.':'Error: '+j.error;$('metaMsg').className='msg '+(j.ok?'ok':'err')})}
