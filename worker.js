@@ -81,23 +81,29 @@ async function getConfig(env) {
 // Public page events: page_view, cta_click
 async function event(request, env) {
   const s = await allSettings(env);
-  const b = await request.json();
+  let b; try { b = await request.json(); } catch (e) { b = {}; }
   const type = String(b.type || "");
   if (!["page_view","cta_click"].includes(type)) return json({ error: "bad type" }, 400);
   const ip = request.headers.get("cf-connecting-ip") || "";
   const ua = (request.headers.get("user-agent") || "").slice(0, 300);
   const vid = String(b.vid || "").slice(0, 64) || null;
   const evName = s["ev_" + type] || "";
-  const fire = s["capi_on_" + type] === "1" && evName && s.pixel_id && s.capi_token;
+  let fire = s["capi_on_" + type] === "1" && evName && s.pixel_id && s.capi_token;
   let capi = "skipped";
   const eventId = b.event_id || crypto.randomUUID();
+  // one Lead per visitor: a repeat click from the same visitor is logged but NOT re-sent to Meta
+  let dup = false;
+  if (type === "cta_click" && vid) {
+    const prev = await env.DB.prepare("SELECT id FROM events WHERE type='cta_click' AND vid=? LIMIT 1").bind(vid).first();
+    if (prev) { dup = true; fire = false; capi = "dup"; }
+  }
   if (fire) {
     try { await sendCapi(s, { name: evName, eventId, ip, ua, fbp: b.fbp, fbc: b.fbc, url: b.url, extId: vid, test: false }); capi = "sent"; }
     catch (e) { capi = "error:" + String(e.message).slice(0, 180); }
   }
   await env.DB.prepare("INSERT INTO events(ts,type,vid,event_id,fbp,fbc,ip,ua,url,meta_event,capi_status,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-    .bind(now(), type, vid, eventId, b.fbp || null, b.fbc || null, ip, ua, b.url || null, fire ? evName : null, capi, "{}").run();
-  return json({ ok: true });
+    .bind(now(), type, vid, eventId, b.fbp || null, b.fbc || null, ip, ua, b.url || null, fire ? evName : null, capi, JSON.stringify({ dup })).run();
+  return json({ ok: true, dup });
 }
 
 async function sendCapi(s, o) {
@@ -136,15 +142,16 @@ async function admin(path, request, env) {
   }
   if (path === "/stats") {
     const q = sql => env.DB.prepare(sql).first().then(r => r.n);
-    const [pv, cc, uniq, reg, regErr, pending, capiErr] = await Promise.all([
+    const [pv, cc, uniq, leads, reg, regErr, pending, capiErr] = await Promise.all([
       q("SELECT COUNT(*) n FROM events WHERE type='page_view'"),
       q("SELECT COUNT(*) n FROM events WHERE type='cta_click'"),
       q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='page_view' AND vid IS NOT NULL"),
+      q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='cta_click' AND vid IS NOT NULL"),
       q("SELECT COUNT(*) n FROM events WHERE type='registration' AND capi_status='sent'"),
       q("SELECT COUNT(*) n FROM events WHERE type='registration' AND capi_status LIKE 'error%'"),
-      q("SELECT COUNT(*) n FROM events WHERE type='cta_click' AND matched=0 AND ts>" + (now() - 86400)),
+      q("SELECT COUNT(DISTINCT vid) n FROM events WHERE type='cta_click' AND ts>" + (now() - 86400) + " AND vid NOT IN (SELECT vid FROM events WHERE type='cta_click' AND matched=1)"),
       q("SELECT COUNT(*) n FROM events WHERE capi_status LIKE 'error%'")]);
-    return json({ page_view: pv, cta_click: cc, unique_visitors: uniq, registrations: reg, registration_errors: regErr, pending_clicks: pending, capi_errors: capiErr, total_display: Number(s.claims_base || 0) + reg, max_claims: Number(s.max_claims || 500) });
+    return json({ page_view: pv, cta_click: cc, unique_visitors: uniq, leads, registrations: reg, registration_errors: regErr, pending_clicks: pending, capi_errors: capiErr, total_display: Number(s.claims_base || 0) + reg, max_claims: Number(s.max_claims || 500) });
   }
   if (path === "/events") {
     const u = new URL(request.url);
@@ -156,10 +163,29 @@ async function admin(path, request, env) {
     const { results } = await env.DB.prepare(sql).bind(...args).all();
     return json(results);
   }
+  // LEADS = unique visitors who clicked "Claim now" (grouped by visitor id)
+  if (path === "/leads" || path === "/leads.csv") {
+    const u = new URL(request.url);
+    const qs = (u.searchParams.get("q") || "").trim().toLowerCase();
+    const limit = Math.min(500, Number(u.searchParams.get("limit") || 100)), offset = Number(u.searchParams.get("offset") || 0);
+    let where = "type='cta_click' AND vid IS NOT NULL"; const args = [];
+    if (qs) { where += " AND (lower(vid) LIKE ? OR ip LIKE ?)"; args.push("%" + qs + "%", "%" + qs + "%"); }
+    const sql = `SELECT vid, MIN(ts) first_ts, MAX(ts) last_ts, COUNT(*) clicks, MAX(ip) ip, MAX(fbc) fbc, MAX(fbp) fbp, MAX(matched) matched, MIN(id) first_id, MAX(CASE WHEN capi_status='sent' THEN 1 ELSE 0 END) capi_sent FROM events WHERE ${where} GROUP BY vid ORDER BY last_ts DESC`;
+    if (path === "/leads.csv") {
+      const { results } = await env.DB.prepare(sql).bind(...args).all();
+      const head = "first_click_ist,last_click_ist,visitor_id,clicks,ip,has_fbc,fired_to_meta\n";
+      const ist = t => new Date(t * 1000).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+      const rows = results.map(r => [ist(r.first_ts), ist(r.last_ts), r.vid, r.clicks, r.ip, r.fbc ? 1 : 0, r.matched ? 1 : 0].map(v => `"${String(v ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
+      return new Response(head + rows, { headers: { "content-type": "text/csv", "content-disposition": "attachment; filename=aureus-leads.csv" } });
+    }
+    const total = await env.DB.prepare(`SELECT COUNT(DISTINCT vid) n FROM events WHERE ${where}`).bind(...args).first();
+    const { results } = await env.DB.prepare(sql + " LIMIT ? OFFSET ?").bind(...args, limit, offset).all();
+    return json({ total: total.n, rows: results.map(r => ({ vid: r.vid, first_ts: r.first_ts, last_ts: r.last_ts, clicks: r.clicks, ip: r.ip, has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched, first_id: r.first_id })) });
+  }
   // recent CTA clicks for the Fire tab (to attach ad-click data to a manual registration)
   if (path === "/clicks") {
-    const { results } = await env.DB.prepare("SELECT id,ts,vid,ip,ua,fbp,fbc,matched FROM events WHERE type='cta_click' ORDER BY id DESC LIMIT 40").all();
-    return json(results.map(r => ({ id: r.id, ts: r.ts, vid: r.vid, ip: r.ip, ua: (r.ua || "").slice(0, 60), has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched })));
+    const { results } = await env.DB.prepare("SELECT MIN(id) id, MIN(ts) ts, MAX(ts) last_ts, COUNT(*) clicks, vid, MAX(ip) ip, MAX(fbp) fbp, MAX(fbc) fbc, MAX(matched) matched FROM events WHERE type='cta_click' AND vid IS NOT NULL GROUP BY vid ORDER BY last_ts DESC LIMIT 40").all();
+    return json(results.map(r => ({ id: r.id, ts: r.ts, last_ts: r.last_ts, clicks: r.clicks, vid: r.vid, ip: r.ip, has_fbc: !!r.fbc, has_fbp: !!r.fbp, matched: !!r.matched })));
   }
   if (path === "/export.csv") {
     const { results } = await env.DB.prepare("SELECT ts,type,address,vid,event_id,fbp,fbc,ip,meta_event,capi_status,matched,click_id,note FROM events ORDER BY id").all();
@@ -195,9 +221,12 @@ async function admin(path, request, env) {
       }
       // pick the ad click to attach (gives Meta fbp/fbc/ip/ua for attribution)
       let click = null;
-      if (mode.startsWith("click:")) click = await env.DB.prepare("SELECT * FROM events WHERE id=? AND type='cta_click'").bind(Number(mode.slice(6))).first();
+      if (mode.startsWith("click:")) {
+        click = await env.DB.prepare("SELECT * FROM events WHERE id=? AND type='cta_click'").bind(Number(mode.slice(6))).first();
+        if (click && !click.fbc && click.vid) { const alt = await env.DB.prepare("SELECT * FROM events WHERE type='cta_click' AND vid=? AND fbc IS NOT NULL ORDER BY id LIMIT 1").bind(click.vid).first(); if (alt) click = alt; }
+      }
       else if (mode.startsWith("vid:")) click = await env.DB.prepare("SELECT * FROM events WHERE vid=? AND type='cta_click' ORDER BY id DESC LIMIT 1").bind(mode.slice(4).trim()).first();
-      else if (mode === "auto") click = await env.DB.prepare("SELECT * FROM events WHERE type='cta_click' AND matched=0 AND ts>? ORDER BY id DESC LIMIT 1").bind(now() - windowSec).first();
+      else if (mode === "auto") click = await env.DB.prepare("SELECT * FROM events WHERE type='cta_click' AND matched=0 AND ts>? AND vid NOT IN (SELECT vid FROM events WHERE type='cta_click' AND matched=1 AND vid IS NOT NULL) ORDER BY id DESC LIMIT 1").bind(now() - windowSec).first();
       const eventId = "reg-" + addr.slice(2, 10) + "-" + Date.now();
       let capi = "skipped", meta = null;
       try {
@@ -206,7 +235,7 @@ async function admin(path, request, env) {
       } catch (e) { capi = "error:" + String(e.message).slice(0, 180); }
       await env.DB.prepare("INSERT INTO events(ts,type,address,vid,event_id,fbp,fbc,ip,ua,url,meta_event,capi_status,matched,click_id,note,extra) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(now(), "registration", addr, click ? click.vid : null, eventId, click ? click.fbp : null, click ? click.fbc : null, click ? click.ip : null, click ? click.ua : null, "https://" + host + "/", evName, capi, click ? 1 : 0, click ? click.id : null, String(b.note || "").slice(0, 120) || null, JSON.stringify({ match: mode, test })).run();
-      if (click && capi === "sent" && !test) await env.DB.prepare("UPDATE events SET matched=1 WHERE id=?").bind(click.id).run();
+      if (click && capi === "sent" && !test) await env.DB.prepare("UPDATE events SET matched=1 WHERE type='cta_click' AND (id=? OR (vid IS NOT NULL AND vid=?))").bind(click.id, click.vid || "").run();
       res.status = capi; res.matched_click = click ? click.id : null; res.events_received = meta && meta.events_received;
       out.push(res);
     }
@@ -436,12 +465,19 @@ const LANDING_HTML = String.raw`<!doctype html>
   function fbc(){var c=cookie('_fbc');if(c)return c;var q=new URLSearchParams(location.search).get('fbclid');return q?('fb.1.'+Date.now()+'.'+q):null}
 
   // ---------- pixel + server event (same event_id = dedup) ----------
+  function flag(k){try{return localStorage.getItem(k)==='1'}catch(e){return false}}
+  function setFlag(k){try{localStorage.setItem(k,'1')}catch(e){}}
   function track(type){
     var eid=uid();
     var evName=CFG&&CFG['ev_'+type];
-    if(window.fbq&&evName&&CFG.pixel_id){try{fbq('track',evName,{},{eventID:eid});}catch(e){}}
+    // Lead (claim click) goes to the pixel only ONCE per visitor; repeat clicks are logged server-side as duplicates
+    var pixelOk = type!=='cta_click' || !flag('aur_lead_'+VID);
+    if(window.fbq&&evName&&CFG.pixel_id&&pixelOk){try{fbq('track',evName,{},{eventID:eid});}catch(e){}}
+    if(type==='cta_click')setFlag('aur_lead_'+VID);
     var body=JSON.stringify({type:type,event_id:eid,vid:VID,fbp:cookie('_fbp'),fbc:fbc(),url:location.href});
-    try{fetch('/api/event',{method:'POST',headers:{'content-type':'application/json'},body:body,keepalive:true}).catch(function(){})}catch(e){}
+    var sent=false;
+    if(navigator.sendBeacon){try{sent=navigator.sendBeacon('/api/event',new Blob([body],{type:'application/json'}))}catch(e){}}
+    if(!sent){try{fetch('/api/event',{method:'POST',headers:{'content-type':'application/json'},body:body,keepalive:true}).catch(function(){})}catch(e){}}
   }
 
   function fmt(n){return Number(n).toLocaleString('en-US')}
@@ -593,6 +629,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
   <div class="tabs">
     <button class="on hot" data-t="fire">Fire to Meta</button>
     <button data-t="dash">Dashboard</button>
+    <button data-t="leads">Leads</button>
     <button data-t="events">Events</button>
     <button data-t="settings">Settings</button>
     <button data-t="meta">Meta / CAPI</button>
@@ -621,7 +658,7 @@ const ADMIN_HTML = String.raw`<!doctype html>
       <div class="res" id="fireRes"></div>
     </div>
     <div class="card">
-      <h3>Recent CTA clicks <small>who tapped "Claim now" · newest first</small></h3>
+      <h3>Recent leads <small>one row per visitor · newest first · full list in Leads tab</small></h3>
       <div class="note" style="margin-bottom:10px">Auto mode picks the newest <b>unmatched</b> click within the window set in Settings. If several people clicked around the same time, pick the right one here.</div>
       <div style="overflow:auto"><table><thead><tr><th>Time (IST)</th><th>Ref</th><th>IP</th><th>fbc</th><th>Used</th><th></th></tr></thead><tbody id="clicks"></tbody></table></div>
     </div>
@@ -638,11 +675,26 @@ const ADMIN_HTML = String.raw`<!doctype html>
   <div class="card">
     <h3>Funnel <small>all time</small></h3>
     <div class="funnel" id="funnel"></div>
-    <div class="flab"><div>Page views</div><div>Claim clicks</div><div>Registrations fired</div></div>
+    <div class="flab"><div>Page views</div><div>Leads (unique)</div><div>Registrations fired</div></div>
   </div>
   <div class="card">
     <h3>Live feed <small>latest 30 · auto-refresh 10s</small></h3>
     <div style="overflow:auto"><table><thead><tr><th>Time (IST)</th><th>Event</th><th>Wallet</th><th>Ref</th><th>Meta</th><th>CAPI</th><th>fbc</th></tr></thead><tbody id="feed"></tbody></table></div>
+  </div>
+</div>
+
+<!-- ============ LEADS ============ -->
+<div class="panel" id="p-leads">
+  <div class="card">
+    <h3>Leads <small>unique visitors who tapped "Claim now" · one row per person</small></h3>
+    <div class="row">
+      <input id="lq" placeholder="search ref or IP" style="width:220px">
+      <button class="btn sm sec" onclick="loadLeads(0)">Search</button>
+      <a class="btn sm" href="/api/admin/leads.csv" style="text-decoration:none">Export CSV</a>
+      <span class="pill" id="lCount"></span>
+    </div>
+    <div style="overflow:auto"><table><thead><tr><th>#</th><th>First click (IST)</th><th>Last click</th><th>Clicks</th><th>Ref</th><th>IP</th><th>fbc</th><th>Fired</th><th></th></tr></thead><tbody id="lBody"></tbody></table></div>
+    <div class="row" style="margin-top:12px"><button class="btn sm sec" onclick="loadLeads(lOff-100)">← Prev</button><button class="btn sm sec" onclick="loadLeads(lOff+100)">Next →</button><span class="mut" id="lPage" style="font-size:12px"></span></div>
   </div>
 </div>
 
@@ -733,13 +785,13 @@ document.querySelectorAll('.tabs button[data-t]').forEach(function(b){b.addEvent
   document.querySelectorAll('.tabs button[data-t]').forEach(function(x){x.classList.remove('on')});
   document.querySelectorAll('.panel').forEach(function(p){p.classList.remove('on')});
   b.classList.add('on');$('p-'+b.dataset.t).classList.add('on');
-  if(b.dataset.t==='events')loadEvents();if(b.dataset.t==='dash')loadDash();if(b.dataset.t==='fire')loadFire();
+  if(b.dataset.t==='events')loadEvents();if(b.dataset.t==='dash')loadDash();if(b.dataset.t==='fire')loadFire();if(b.dataset.t==='leads')loadLeads(0);
 })});
 
 function ist(ts){return new Date(ts*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false,day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit'})}
 function sh(a){return a?'<span title="'+a+'">'+a.slice(0,6)+'…'+a.slice(-4)+'</span>':'<span class="mut">—</span>'}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function capiCell(s){if(!s)return'';if(s==='sent')return'<span class="ok">sent</span>';if(s==='skipped')return'<span class="mut">—</span>';return'<span class="err" title="'+esc(s)+'">error</span>'}
+function capiCell(s){if(!s)return'';if(s==='sent')return'<span class="ok">sent</span>';if(s==='dup')return'<span class="mut" title="repeat click, not re-sent">dup</span>';if(s==='skipped')return'<span class="mut">—</span>';return'<span class="err" title="'+esc(s)+'">error</span>'}
 function rowHtml(e,withIp){
   return '<tr><td>'+ist(e.ts)+'</td><td><span class="tag t-'+e.type+'">'+e.type.replace('_',' ')+'</span></td><td>'+sh(e.address)+'</td><td>'+(e.vid?'<span class="mut">'+esc(e.vid).slice(0,8)+'</span>':'<span class="mut">—</span>')+'</td><td>'+(e.meta_event||'<span class="mut">—</span>')+'</td><td>'+capiCell(e.capi_status)+'</td><td>'+(withIp?esc(e.ip||''):(e.fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>'))+'</td>'+(withIp?'<td>'+esc(e.note||'')+'</td>':'')+'</tr>';
 }
@@ -748,9 +800,9 @@ function rowHtml(e,withIp){
 function loadFire(){
   api('/clicks').then(function(cl){
     var sel=$('fMatch'),cur=sel.value;
-    sel.innerHTML='<option value="auto">Auto — latest unmatched click</option><option value="none">None — wallet only</option>'+cl.map(function(c){return'<option value="click:'+c.id+'">'+ist(c.ts)+' · '+(c.ip||'')+(c.has_fbc?' · fbc✓':'')+(c.matched?' · used':'')+'</option>'}).join('');
+    sel.innerHTML='<option value="auto">Auto — latest unmatched click</option><option value="none">None — wallet only</option>'+cl.map(function(c){return'<option value="click:'+c.id+'">'+ist(c.last_ts||c.ts)+' · '+(c.ip||'')+(c.has_fbc?' · fbc✓':'')+(c.matched?' · used':'')+'</option>'}).join('');
     sel.value=cur||'auto';
-    $('clicks').innerHTML=cl.length?cl.map(function(c){return'<tr><td>'+ist(c.ts)+'</td><td class="mut">'+esc(c.vid||'').slice(0,8)+'</td><td>'+esc(c.ip||'')+'</td><td>'+(c.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(c.matched?'<span class="mut">used</span>':'<span class="ok">free</span>')+'</td><td><button class="btn sm sec" onclick="pick('+c.id+')">use</button></td></tr>'}).join(''):'<tr><td colspan="6" class="mut">No clicks yet.</td></tr>';
+    $('clicks').innerHTML=cl.length?cl.map(function(c){return'<tr><td>'+ist(c.last_ts||c.ts)+(c.clicks>1?' <span class="mut">×'+c.clicks+'</span>':'')+'</td><td class="mut">'+esc(c.vid||'').slice(0,8)+'</td><td>'+esc(c.ip||'')+'</td><td>'+(c.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(c.matched?'<span class="mut">used</span>':'<span class="ok">free</span>')+'</td><td><button class="btn sm sec" onclick="pick('+c.id+')">use</button></td></tr>'}).join(''):'<tr><td colspan="6" class="mut">No clicks yet.</td></tr>';
   }).catch(function(){});
   api('/events?type=registration&limit=20').then(function(ev){
     $('fired').innerHTML=ev.length?ev.map(function(e){return'<tr><td>'+ist(e.ts)+'</td><td>'+sh(e.address)+'</td><td>'+(e.meta_event||'')+'</td><td>'+capiCell(e.capi_status)+'</td><td>'+(e.click_id?'<span class="ok">#'+e.click_id+'</span>':'<span class="mut">none</span>')+'</td><td>'+esc(e.note||'')+'</td></tr>'}).join(''):'<tr><td colspan="6" class="mut">Nothing fired yet.</td></tr>';
@@ -772,12 +824,25 @@ function fire(){
   }).catch(function(e){$('fireBtn').disabled=false;$('fireMsg').textContent='Error';$('fireMsg').className='msg err'});
 }
 
+// ---- Leads ----
+var lOff=0;
+function loadLeads(off){
+  lOff=Math.max(0,off||0);
+  api('/leads?limit=100&offset='+lOff+'&q='+encodeURIComponent($('lq').value.trim())).then(function(j){
+    $('lCount').textContent=j.total+' leads';
+    $('lPage').textContent=(lOff+1)+'–'+Math.min(lOff+100,j.total)+' of '+j.total;
+    $('lBody').innerHTML=j.rows.length?j.rows.map(function(r,i){return'<tr><td class="mut">'+(lOff+i+1)+'</td><td>'+ist(r.first_ts)+'</td><td>'+ist(r.last_ts)+'</td><td>'+(r.clicks>1?'<span style="color:#F5C97A">'+r.clicks+'</span>':r.clicks)+'</td><td class="mut">'+esc(r.vid).slice(0,8)+'</td><td>'+esc(r.ip||'')+'</td><td>'+(r.has_fbc?'<span class="ok">✓</span>':'<span class="mut">—</span>')+'</td><td>'+(r.matched?'<span class="ok">yes</span>':'<span class="mut">no</span>')+'</td><td><button class="btn sm sec" onclick="useLead('+r.first_id+')">fire</button></td></tr>'}).join(''):'<tr><td colspan="9" class="mut">No leads yet.</td></tr>';
+  }).catch(function(){});
+}
+function useLead(id){pick(id);document.querySelector('.tabs button[data-t=fire]').click()}
+$('lq').addEventListener('keydown',function(e){if(e.key==='Enter')loadLeads(0)});
+
 // ---- Dashboard ----
 function loadDash(){
   api('/stats').then(function(s){
-    var cards=[['Page views',s.page_view],['Claim clicks',s.cta_click,s.unique_visitors+' unique visitors'],['Registrations fired',s.registrations,s.registration_errors?s.registration_errors+' failed':'to Meta'],['Clicks pending',s.pending_clicks,'unmatched, last 24h'],['Counter on page',s.total_display+' / '+s.max_claims],['CAPI errors',s.capi_errors]];
+    var cards=[['Page views',s.page_view],['Leads (unique)',s.leads,s.cta_click+' total clicks · '+s.unique_visitors+' visitors'],['Registrations fired',s.registrations,s.registration_errors?s.registration_errors+' failed':'to Meta'],['Clicks pending',s.pending_clicks,'unmatched, last 24h'],['Counter on page',s.total_display+' / '+s.max_claims],['CAPI errors',s.capi_errors]];
     $('stats').innerHTML=cards.map(function(c){return'<div class="stat"><div class="k">'+c[0]+'</div><div class="v">'+(c[1]||0)+'</div>'+(c[2]?'<div class="s">'+c[2]+'</div>':'')+'</div>'}).join('');
-    var f=[s.page_view,s.cta_click,s.registrations],mx=Math.max.apply(null,f.concat([1]));
+    var f=[s.page_view,s.leads,s.registrations],mx=Math.max.apply(null,f.concat([1]));
     $('funnel').innerHTML=f.map(function(v){return'<div class="fbar" style="height:'+Math.max(4,v/mx*100)+'%"><span>'+(v||0)+'</span></div>'}).join('');
   }).catch(function(){});
   api('/events?limit=30').then(function(ev){$('feed').innerHTML=ev.map(function(e){return rowHtml(e,false)}).join('')}).catch(function(){});
