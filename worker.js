@@ -8,7 +8,7 @@
 // Tables auto-create on first request. No contracts, no wallet connect here.
 
 const PUBLIC_KEYS = ["site_name","token_symbol","amount_per_wallet","max_claims","claims_open","dapp_link","trust_deeplink","append_ref","pixel_id","ev_page_view","ev_cta_click","telegram_link","bscscan_link","gas_fee_text"];
-const SECRET_KEYS = ["capi_token","hook_secret"];
+const SECRET_KEYS = ["capi_token","hook_secret","capi_token_2"];
 
 const SCHEMA = [
 `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
@@ -190,9 +190,25 @@ async function sendCapi(s, o) {
   if (o.extId) user_data.external_id = [await sha256(String(o.extId).toLowerCase())];
   const body = { data: [{ event_name: o.name, event_time: o.time || now(), event_id: o.eventId, action_source: "website", event_source_url: o.url || undefined, user_data }] };
   if (o.test && s.capi_test_code) body.test_event_code = s.capi_test_code;
-  const r = await fetch(`https://graph.facebook.com/v21.0/${s.pixel_id}/events?access_token=${encodeURIComponent(s.capi_token)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const post = (pid, tok, b) => fetch(`https://graph.facebook.com/v21.0/${pid}/events?access_token=${encodeURIComponent(tok)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b), signal: AbortSignal.timeout(10000) });
+  // BACKUP PIXEL: same event dusre BM ke pixel pe bhi (test events backup pe nahi jaate)
+  const backup = (!o.test && s.pixel_id_2 && s.capi_token_2 && s.pixel_id_2 !== s.pixel_id)
+    ? post(s.pixel_id_2, s.capi_token_2, { data: body.data }).then(r => r.ok ? null : r.text().then(t => console.error("backup pixel failed:", t))).catch(e => console.error("backup pixel error:", e.message))
+    : Promise.resolve();
+  const [r] = await Promise.all([post(s.pixel_id, s.capi_token, body), backup]);
   const j = await r.json();
   if (!r.ok) throw new Error(j.error?.message || "capi failed");
+  return j;
+}
+
+async function sendCapiBackupTest(s, o) {
+  if (!s.pixel_id_2 || !s.capi_token_2) throw new Error("Backup Pixel ID + token set karo pehle");
+  const user_data = { client_ip_address: o.ip || undefined, client_user_agent: o.ua || undefined };
+  const body = { data: [{ event_name: o.name, event_time: now(), event_id: o.eventId, action_source: "website", event_source_url: o.url, user_data }] };
+  if (s.capi_test_code_2) body.test_event_code = s.capi_test_code_2;
+  const r = await fetch(`https://graph.facebook.com/v21.0/${s.pixel_id_2}/events?access_token=${encodeURIComponent(s.capi_token_2)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error?.message || "backup capi failed");
   return j;
 }
 
@@ -279,6 +295,10 @@ async function admin(path, request, env) {
   if (path === "/test-capi" && request.method === "POST") {
     const { event } = await request.json();
     try { const r = await sendCapi(s, { name: event || "Lead", eventId: "test-" + Date.now(), ip: request.headers.get("cf-connecting-ip"), ua: "aureus-admin-test", url: "https://" + host, test: true }); return json({ ok: true, meta: r }); }
+    catch (e) { return json({ ok: false, error: e.message }, 400); }
+  }
+  if (path === "/test-capi-backup" && request.method === "POST") {
+    try { const r = await sendCapiBackupTest(s, { name: "Lead", eventId: "test2-" + Date.now(), ip: request.headers.get("cf-connecting-ip"), ua: "aureus-admin-test", url: "https://" + host }); return json({ ok: true, meta: r }); }
     catch (e) { return json({ ok: false, error: e.message }, 400); }
   }
 
@@ -960,6 +980,16 @@ const ADMIN_HTML = String.raw`<!doctype html>
     </div>
   </div>
   <div class="card">
+    <h3>Backup Pixel <small>dusre BM ka pixel — har event yahan bhi jaayega</small></h3>
+    <p style="color:var(--sub);font-size:13px;margin:0 0 10px">Main BM chala gaya toh bhi poora Lead / claim data is pixel mein safe rahega. Khaali chhodo toh band.</p>
+    <div class="cols">
+      <div class="f"><label>Backup Pixel / Dataset ID</label><input data-k="pixel_id_2"></div>
+      <div class="f"><label>Backup CAPI access token</label><input data-k="capi_token_2" type="password" placeholder="EAAB…"></div>
+      <div class="f"><label>Backup test event code (sirf test ke liye)</label><input data-k="capi_test_code_2" placeholder="TEST12345"></div>
+    </div>
+    <div class="row"><button class="btn" onclick="saveSettings()">Save</button><button class="btn" onclick="testBackup()">Test backup pixel</button><span class="msg" id="bkMsg"></span></div>
+  </div>
+  <div class="card">
     <h3>Event mapping</h3>
     <div class="cols">
       <div class="f"><label>Page view → <span class="mut">(pixel)</span></label><input data-k="ev_page_view"></div>
@@ -1083,6 +1113,7 @@ function showHookHelp(){var sec=document.querySelector('[data-k=hook_secret]').v
 function collect(){var o={};document.querySelectorAll('[data-k]').forEach(function(el){o[el.dataset.k]=el.hasAttribute('data-bool')?(el.checked?'1':'0'):el.value.trim()});return o}
 function saveSettings(){api('/settings',{method:'PUT',body:JSON.stringify(collect())}).then(function(j){var m=j.ok?'Saved.':'Error: '+j.error;['setMsg','metaMsg'].forEach(function(id){$(id).textContent=m;$(id).className='msg '+(j.ok?'ok':'err')});loadSettings();loadDash()})}
 function testCapi(){$('metaMsg').textContent='Sending…';api('/test-capi',{method:'POST',body:JSON.stringify({event:$('p-meta').querySelector('[data-k=ev_cta_click]').value||'Lead'})}).then(function(j){$('metaMsg').textContent=j.ok?'Sent. Check Events Manager → Test events.':'Error: '+j.error;$('metaMsg').className='msg '+(j.ok?'ok':'err')})}
+function testBackup(){$('bkMsg').textContent='Sending…';$('bkMsg').className='msg';api('/test-capi-backup',{method:'POST'}).then(function(j){$('bkMsg').textContent=j.ok?'Sent. Backup pixel → Events Manager → Test events check karo.':'Error: '+j.error;$('bkMsg').className='msg '+(j.ok?'ok':'err')})}
 function loadAll(){loadFire();loadDash();loadSettings()}
 
 api('/stats').then(showApp).catch(showLogin);
